@@ -113,11 +113,10 @@ int main(int argc, char *argv[]) {
     if (strcmp(args.mode, "raw_tcp_spoof") == 0) args.is_raw_tcp_spoof = 1;
     if (strcmp(args.mode, "raw_udp_spoof") == 0) args.is_raw_udp_spoof = 1;
     if (strstr(args.mode, "dns_v16")) args.is_v16_dns_amp = 1;
-    if (strstr(args.mode, "v17_proxy")) { args.is_v17_tcp_bypass = 1; args.is_v18_tls = 1; args.is_v17_safe_proxy = 1; } // V17 safe + SOCKS5 proxy + TLS
-    else if (strstr(args.mode, "tcp_v17") || strstr(args.mode, "v17")) args.is_v17_tcp_bypass = 1;
+    if (strstr(args.mode, "tcp_v17") || strstr(args.mode, "v17")) args.is_v17_tcp_bypass = 1;
     if (strstr(args.mode, "quic_v18")) args.is_v18_quic = 1;
     if (strstr(args.mode, "tls_v18") || strstr(args.mode, "v18_tls") || strstr(args.mode, "tls")) { args.is_v18_tls = 1; args.is_v17_tcp_bypass = 1; } // TLS uses V17 3WHS engine
-    if (strstr(args.mode, "v18_tcp")) { args.is_v18_tcp = 1; args.is_v17_tcp_bypass = 1; } // Pure TCP: raw 3WHS engine with TLS-like traffic
+    if (strstr(args.mode, "v18_tcp")) { args.is_v18_tcp = 1; args.is_v17_tcp_bypass = 1; } // Pure TCP: 3WHS engine, no TLS
     if (strstr(args.mode, "stealth")) { args.is_stealth = 1; args.is_v18_tcp = 1; args.is_v17_tcp_bypass = 1; } // AF_PACKET raw engine
     if (strstr(args.mode, "v20_ws")) { args.is_v20_ws = 1; } // WebSocket L7 flood (CF Tunnel bypass)
     if (strstr(args.mode, "v19_tcp")) { args.is_v19_tcp = 1; args.is_v15_raw_amp = 1; }
