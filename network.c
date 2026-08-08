@@ -120,11 +120,25 @@ int resolve_host(const char *host, char *ip_buf) {
         ip_buf[63] = '\0';
         return 0;
     }
-    struct hostent *he = gethostbyname(host);
-    if (!he) return -1;
-    struct in_addr **addr_list = (struct in_addr **)he->h_addr_list;
-    strncpy(ip_buf, inet_ntoa(*addr_list[0]), 63);
+    
+    struct in_addr _addr;
+    if (inet_pton(AF_INET, host, &_addr) == 1) {
+        strncpy(ip_buf, host, 63);
+        ip_buf[63] = '\0';
+        return 0;
+    }
+    
+    struct addrinfo hints, *res;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, NULL, &hints, &res) != 0) {
+        return -1;
+    }
+    struct sockaddr_in *ipv4 = (struct sockaddr_in *)res->ai_addr;
+    inet_ntop(AF_INET, &(ipv4->sin_addr), ip_buf, 63);
     ip_buf[63] = '\0';
+    freeaddrinfo(res);
     return 0;
 }
 
